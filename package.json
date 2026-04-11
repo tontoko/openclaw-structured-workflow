@@ -25,6 +25,9 @@
       "pluginSdkVersion": "2026.4.9"
     }
   },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.49"
+  },
   "devDependencies": {
     "typescript": "^6.0.2",
     "ultracite": "^7.4.4"
