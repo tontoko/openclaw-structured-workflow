@@ -82,6 +82,15 @@ const PLUGIN_ID = "structured-workflow";
 // In-memory fallback when TaskFlow runtime is not available
 const standaloneStore = new Map<string, { state: WorkflowState; revision: number }>();
 let standaloneCounter = 0;
+let standalonePermissionMode: PermissionMode = "bypass";
+const MAX_STANDALONE_WORKFLOWS = 50;
+
+function pruneStandaloneStore() {
+  if (standaloneStore.size <= MAX_STANDALONE_WORKFLOWS) return;
+  const keys = [...standaloneStore.keys()];
+  const toRemove = keys.slice(0, keys.length - MAX_STANDALONE_WORKFLOWS);
+  for (const key of toRemove) standaloneStore.delete(key);
+}
 const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"];
 const ACTIVATION_KEYWORDS = ["ultrawork", "ulw", "task-driven"];
 const COMPLEXITY_HINTS = [
@@ -152,6 +161,7 @@ export default definePluginEntry({
         } else {
           // Standalone fallback — no TaskFlow runtime
           standaloneCounter++;
+          pruneStandaloneStore();
           flowId = `standalone-${standaloneCounter}`;
           revision = 1;
           standaloneStore.set(flowId, { state, revision });
@@ -322,10 +332,16 @@ export default definePluginEntry({
         ]),
       }),
       async execute(_id: string, params: any) {
-        if (typeof api.updateConfig !== "function") {
-          return toolError("Config update is not available in this runtime.");
+        if (typeof api.updateConfig === "function") {
+          await maybeAwait(api.updateConfig({ permissionMode: params.mode }));
+        } else {
+          // Standalone fallback: store in memory
+          standalonePermissionMode = params.mode;
+          // Also update all existing workflows
+          for (const [, entry] of standaloneStore) {
+            entry.state.permissionMode = params.mode;
+          }
         }
-        await maybeAwait(api.updateConfig({ permissionMode: params.mode }));
         return textResult(`🔐 Permission mode set to: ${params.mode}`);
       },
     });
@@ -346,7 +362,16 @@ export default definePluginEntry({
       if (/STOP_REQUEST/.test(previous)) return {};
 
       const taskFlow = findActiveWorkflow(api, event);
-      const state = taskFlow ? readWorkflowState(taskFlow.stateJson) : undefined;
+      let state = taskFlow ? readWorkflowState(taskFlow.stateJson) : undefined;
+
+      // Standalone fallback: check in-memory store
+      if (!state) {
+        const latestKey = [...standaloneStore.keys()].pop();
+        if (latestKey) {
+          const entry = standaloneStore.get(latestKey);
+          if (entry) state = entry.state;
+        }
+      }
       const incomplete =
         state?.tasks.filter((task) => task.status === "pending" || task.status === "running") ?? [];
       if (!state || incomplete.length === 0) return {};
@@ -557,7 +582,7 @@ function _shouldActivateFlow(text: string, config: ReturnType<typeof readConfig>
 }
 
 function toolError(message: string) {
-  return { content: [{ type: "text" as const, text: `Error: ${message}` }] };
+  return { content: [{ type: "text" as const, text: `❌ ${message}` }] };
 }
 
 function textResult(text: string) {

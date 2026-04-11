@@ -1,118 +1,102 @@
-# Design Document
+# Design: Structured Workflow Plugin
 
-## Overview
-
-Structured Workflow is an OpenClaw plugin that brings ULW (Ultrawork)-style task-list driven workflows to OpenClaw agents. It leverages the built-in TaskFlow runtime for durable state management.
-
-## Core Concepts
-
-### Task Lifecycle
+## Architecture
 
 ```
-pending → running → completed
-                 → skipped
-                 → blocked
+┌─────────────────────────────────────────────┐
+│              OpenClaw Gateway                │
+├─────────────────────────────────────────────┤
+│  Plugin: structured-workflow                │
+│  ├─ Tools (4)                               │
+│  │  ├─ tasklist_create                      │
+│  │  ├─ tasklist_update                      │
+│  │  ├─ tasklist_status                      │
+│  │  └─ tasklist_permission                  │
+│  └─ Hook (1)                                │
+│     └─ before_prompt_build (forced continu.)│
+├─────────────────────────────────────────────┤
+│  Storage Layer                              │
+│  ├─ TaskFlow Runtime (preferred)            │
+│  │  └─ api.runtime.tasks.flow               │
+│  └─ Standalone Fallback (in-memory Map)     │
+│     └─ standaloneStore (max 50 entries)     │
+└─────────────────────────────────────────────┘
 ```
 
-### Decision Policies
+## Dual Storage Mode
 
-Each task has a `decisionPolicy` that determines how decisions are made:
+### TaskFlow Mode (preferred)
+- Used when `api.runtime.tasks.flow.fromToolContext(ctx)` succeeds
+- Durable state, revision tracking, session binding
+- Requires `ctx.sessionKey` (available in main/agent sessions)
 
-| Policy | Who decides | Use case |
-|--------|------------|----------|
-| `auto` | Assigned agent autonomously | Implementation, testing, research |
-| `deliberate` | Multiple agents discuss | Architecture, design, strategy |
-| `confirm` | Human must approve | Money-path, security, deployment |
-| `notify` | Agent executes, reports result | Status updates, summaries |
+### Standalone Mode (fallback)
+- Activated when TaskFlow throws (missing `sessionKey`)
+- In-memory `Map<string, { state, revision }>`
+- GC: prunes to 50 entries on new workflow creation
+- Survives for gateway process lifetime only
+- `tasklist_permission` stores mode in `standalonePermissionMode`
 
-### Permission Modes
+## Tool Flow
 
-Inspired by Claude Code's permission system:
+```
+tasklist_create:
+  1. Try getTaskFlow(api, ctx) → catch → undefined
+  2. If TaskFlow: createManaged() → flowId + revision
+  3. If standalone: increment counter → store in Map
+  4. Return formatted task list
 
-| Mode | Behavior |
-|------|----------|
-| `bypass` | No confirmations. Full autonomous execution. |
-| `allow-after-first` | First occurrence of each operation type requires confirmation. Subsequent same-type operations proceed automatically. |
-| `confirm-each` | Every step requires human confirmation. |
+tasklist_update:
+  1. Try getTaskFlow → TaskFlow state
+  2. If no TaskFlow: find latest from standaloneStore
+  3. Apply status change, optional fields
+  4. Write back to respective store
+  5. If running + sessionKey + TaskFlow: runTask()
 
-Mode can be switched at any time via the `tasklist_permission` tool or a slash command.
+tasklist_status:
+  1. Try TaskFlow first, then standalone
+  2. Return formatted progress
 
-### Flow Detection
+tasklist_permission:
+  1. Try api.updateConfig() (plugin config persistence)
+  2. If unavailable: store in standalonePermissionMode + update all workflows
+```
 
-Messages are classified into:
+## Hook: before_prompt_build
 
-1. **Simple conversation** — No flow created. Agent responds normally.
-2. **Complex task** — Flow created, task list generated, execution begins.
+```
+On every prompt build:
+  1. Check forceContinuation config (default: true)
+  2. Check cancel keywords in incoming message → skip if found
+  3. Check STOP_REQUEST in previous response → skip if found
+  4. Try findActiveWorkflow(api, event) → TaskFlow
+  5. If no TaskFlow: check standaloneStore for latest workflow
+  6. Find incomplete tasks (pending/running)
+  7. If found: inject prependSystemContext with continuation reminder
+```
 
-Detection strategies:
-- `auto` — Plugin + agent heuristics analyze message complexity
-- `keyword-only` — Only activate on explicit keywords (ultrawork, ulw, task-driven)
+## Configuration Requirements
 
-### Forced Continuation
+### tools.alsoAllow
+Plugin tools are NOT included in `tools.profile: "coding"`. Must add:
+```json
+"alsoAllow": ["tasklist_create", "tasklist_update", "tasklist_status", "tasklist_permission"]
+```
 
-When `forceContinuation` is enabled:
-- `before_prompt_build` hook checks active flows for incomplete tasks
-- If incomplete tasks exist and no cancel keyword detected → inject continuation prompt
-- Cancel keywords (`/stop`, `やめて`, `cancel`, etc.) always take priority
-
-### Deliberate (Multi-agent Discussion)
-
-When a task has `decisionPolicy: "deliberate"`:
-1. Plugin dispatches discussion to configured agents
-2. Rounds: configurable (default 3 max)
-3. Termination: consensus score threshold OR max rounds reached
-4. Result is written back to the task's state
-
-This generalizes the T1 discussion pattern. Project-specific discussion formats are handled by skills, not the plugin.
-
-## Task State (stateJson)
-
+### Plugin config
 ```json
 {
-  "type": "workflow",
-  "title": "Stripe Cancellation Flow",
-  "tasks": [
-    {
-      "id": "1",
-      "title": "Requirements Research",
-      "status": "completed",
-      "decisionPolicy": "auto",
-      "assignedAgent": "worker-coder",
-      "sessionKey": "agent:worker-coder:subagent:abc123",
-      "completedAt": "2026-04-11T01:03:00Z",
-      "evidence": "Found existing patterns in src/stripe/"
-    },
-    {
-      "id": "2",
-      "title": "Architecture Design",
-      "status": "running",
-      "decisionPolicy": "deliberate",
-      "deliberateWith": ["brain", "worker-frontend"],
-      "assignedAgent": "brain",
-      "sessionKey": "agent:brain:subagent:def456"
-    }
-  ],
-  "permissionMode": "bypass",
-  "createdAt": "2026-04-11T01:00:00Z",
-  "updatedAt": "2026-04-11T01:03:00Z"
+  "permissionMode": "bypass" | "allow-after-first" | "confirm-each",
+  "forceContinuation": true,
+  "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"],
+  "flowDetectionMode": "auto" | "keyword-only",
+  "activationKeywords": ["ultrawork", "ulw", "task-driven"]
 }
 ```
 
-## Tools Provided
+## Key Learnings
 
-| Tool | Description |
-|------|-------------|
-| `tasklist_create` | Create a structured task list with decision policies |
-| `tasklist_update` | Update task status with evidence |
-| `tasklist_status` | Show current workflow status |
-| `tasklist_permission` | Switch permission mode |
-
-## Hooks
-
-| Hook | Event | Purpose |
-|------|-------|---------|
-| Forced continuation | `before_prompt_build` | Inject continuation prompt for incomplete tasks |
-
-## Configuration
-
-See `openclaw.plugin.json` for the full config schema.
+1. **TaskFlow fromToolContext throws**: `ctx.sessionKey` is validated inside OpenClaw's runtime before returning. Must use try-catch.
+2. **Plugin tools need alsoAllow**: `tools.profile: "coding"` is a whitelist that excludes plugin tools.
+3. **@sinclair/typebox**: Must be in plugin's `dependencies` even though OpenClaw provides it at runtime (path resolution issue).
+4. **SeaORM Proxy API**: `ProxyRow`/`ProxyExecResult` are not re-exported at crate root. Use simpler Extension-based approaches instead.

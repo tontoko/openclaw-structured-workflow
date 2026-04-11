@@ -1,35 +1,48 @@
-# OpenClaw Structured Workflow Plugin
+# Structured Workflow Plugin for OpenClaw
 
-Task-list driven workflow plugin for [OpenClaw](https://github.com/openclaw/openclaw), inspired by [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode)'s ULW (Ultrawork) mode.
-
-Built on OpenClaw's **TaskFlow** runtime for durability across gateway restarts.
+Task-list driven workflow with structured decomposition, decision policies, permission modes, and forced continuation.
 
 ## Features
 
-- **Structured Task Decomposition**: Automatically breaks complex instructions into phased task lists (research → design → test → implement → test → verify)
-- **Decision Policies**: Each task can have a different decision level:
-  - `auto` — Agent proceeds independently
-  - `deliberate` — Dispatch discussion to multiple agents (configurable)
-  - `confirm` — Requires human approval before proceeding
-  - `notify` — Execute then report result
-- **Permission Modes** (Claude Code-style):
-  - `bypass` — No confirmation needed, full speed ahead
-  - `allow-after-first` — Confirm once per operation type, then auto
-  - `confirm-each` — Confirm every step
-- **Forced Continuation**: Via `before_prompt_build` hook — incomplete tasks trigger continuation instructions. Cancel keywords always take priority.
-- **Durable State**: TaskFlow `stateJson` persists task lists, agent assignments, and session links across restarts
-- **Task ↔ Agent ↔ Session Tracking**: Each task links to the executing agent and session for full traceability
-- **Normal Conversation Friendly**: Flow detection passes simple messages through without creating task flows
+- **Structured Task Lists**: Create decomposed task lists with IDs, titles, descriptions, and decision policies
+- **Decision Policies**: `auto`, `deliberate`, `confirm`, `notify` — control how each task is executed
+- **Permission Modes**: `bypass`, `allow-after-first`, `confirm-each` — scope agent autonomy
+- **Forced Continuation**: `before_prompt_build` hook injects context to keep agents on-task
+- **TaskFlow Compatible**: Uses OpenClaw's TaskFlow runtime when available; falls back to standalone in-memory mode
+- **Cancel Keywords**: Users can cancel with `/stop`, `キャンセル`, etc.
 
-## Install
+## Installation
 
 ```bash
-openclaw plugins install @tontoko/openclaw-structured-workflow
+# From local source
+openclaw plugins install ~/openclaw-structured-workflow
+
+# Restart gateway to load
+openclaw gateway restart
 ```
 
-## Configuration
+### Required Configuration
 
-Add to your `openclaw.json`:
+Add plugin tools to `tools.alsoAllow` in your OpenClaw config (`~/.openclaw/openclaw.json`):
+
+```json
+{
+  "tools": {
+    "profile": "coding",
+    "alsoAllow": [
+      "browser",
+      "tasklist_create",
+      "tasklist_update",
+      "tasklist_status",
+      "tasklist_permission"
+    ]
+  }
+}
+```
+
+> **Note**: The `coding` profile does not include plugin-provided tools by default. You must add them to `alsoAllow`.
+
+### Plugin Config (Optional)
 
 ```json
 {
@@ -40,9 +53,9 @@ Add to your `openclaw.json`:
         "config": {
           "permissionMode": "bypass",
           "forceContinuation": true,
-          "deliberateDefaultAgents": [],
-          "deliberateMaxRounds": 3,
-          "cancelKeywords": ["/stop", "やめて", "cancel", "stop"]
+          "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"],
+          "flowDetectionMode": "auto",
+          "activationKeywords": ["ultrawork", "ulw", "task-driven"]
         }
       }
     }
@@ -50,34 +63,101 @@ Add to your `openclaw.json`:
 }
 ```
 
-## Architecture
+## Tools
 
-```
-User Instruction
-  ↓
-before_prompt_build: Flow Detection
-  ├─ Simple message → pass through (no flow created)
-  └─ Complex task → TaskFlow.createManaged()
-       ↓
-  Task List Generation (each task with decisionPolicy)
-       ↓
-  Execution Loop:
-    ├─ auto → dispatch to target agent → await completion
-    ├─ deliberate → dispatch discussion to multiple agents → await consensus
-    ├─ confirm → setWaiting() → await human response → resume()
-    └─ notify → execute + send result notification
-       ↓
-  Force Continuation Check (before_prompt_build):
-    ├─ All complete → finish()
-    ├─ Incomplete + no cancel keyword → inject continuation prompt
-    └─ Cancel keyword detected → allow stop
+### `tasklist_create`
+
+Create a structured task list for a complex instruction.
+
+```json
+{
+  "title": "Implement Feature X",
+  "tasks": [
+    { "id": "1", "title": "Design schema", "decisionPolicy": "auto" },
+    { "id": "2", "title": "Implement API", "description": "CRUD endpoints", "decisionPolicy": "auto" },
+    { "id": "3", "title": "Security review", "decisionPolicy": "confirm" },
+    { "id": "4", "title": "Deploy", "decisionPolicy": "notify" }
+  ]
+}
 ```
 
-## CLI
+### `tasklist_update`
+
+Update a task's status in the workflow.
+
+```json
+{
+  "taskId": "1",
+  "status": "running",
+  "assignedAgent": "worker-coder",
+  "sessionKey": "agent:worker-coder:subagent:abc123"
+}
+```
+
+Valid statuses: `running`, `completed`, `skipped`, `blocked`
+
+### `tasklist_status`
+
+Show current task list status for a workflow.
+
+```json
+{ "flowId": "standalone-1" }
+```
+
+### `tasklist_permission`
+
+Switch permission mode.
+
+```json
+{ "mode": "allow-after-first" }
+```
+
+Valid modes: `bypass`, `allow-after-first`, `confirm-each`
+
+## Decision Policies
+
+| Policy | Behavior |
+|--------|----------|
+| `auto` | Agent proceeds without confirmation |
+| `deliberate` | Agent discusses approach before proceeding |
+| `confirm` | Agent waits for explicit user approval |
+| `notify` | Agent informs user after completion |
+
+## Standalone Mode
+
+When OpenClaw's TaskFlow runtime is not available (e.g., sub-agent sessions without `sessionKey`), the plugin automatically falls back to an in-memory store. All tools work in standalone mode:
+
+- Workflows are stored in memory for the gateway process lifetime
+- Revision tracking still works
+- `tasklist_permission` requires `api.updateConfig` (not available in standalone)
+
+## Hook: `before_prompt_build`
+
+When a workflow has incomplete tasks, the plugin injects a system context reminder:
+
+```
+Continue the active structured workflow.
+Workflow: Implement Feature X
+Remaining tasks: 2
+Focus on the next pending or running task before answering anything else.
+If the user explicitly requested cancellation, honor it instead.
+```
+
+This keeps the agent focused on completing the task list.
+
+## Development
 
 ```bash
-openclaw tasks flow list          # List active workflows
-openclaw tasks flow show <id>     # Inspect a workflow with all tasks and agent links
+# Install dependencies
+npm install
+
+# Lint and format
+npx @biomejs/biome check --write src/index.ts
+
+# Reinstall after changes
+rm -rf ~/.openclaw/extensions/structured-workflow
+openclaw plugins install ~/openclaw-structured-workflow
+openclaw gateway restart
 ```
 
 ## License
