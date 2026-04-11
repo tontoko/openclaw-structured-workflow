@@ -573,7 +573,7 @@ function containsKeyword(text: string, keywords: string[]): boolean {
   return keywords.some((keyword) => normalized.includes(keyword.toLowerCase()));
 }
 
-function _shouldActivateFlow(text: string, config: ReturnType<typeof readConfig>): boolean {
+export function shouldActivateFlow(text: string, config: ReturnType<typeof readConfig>): boolean {
   if (config.flowDetectionMode === "keyword-only") {
     return containsKeyword(text, config.activationKeywords);
   }
