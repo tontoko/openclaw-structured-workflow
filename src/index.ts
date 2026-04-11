@@ -345,9 +345,6 @@ export default definePluginEntry({
     api.on("before_prompt_build", async (event: PromptBuildEvent) => {
       const config = readConfig(api);
       if (config.forceContinuation === false) return {};
-      console.log(
-        `[structured-workflow] before_prompt_build fired, standaloneStore.size=${standaloneStore.size}, prompt=${(event.prompt ?? "").slice(0, 50)}`,
-      );
 
       const incomingText = event.prompt ?? "";
       const messages = event.messages ?? [];
