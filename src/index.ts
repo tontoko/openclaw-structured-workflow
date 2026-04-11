@@ -5,10 +5,10 @@
  * and forced continuation. Built on TaskFlow for durability.
  */
 
-// @ts-expect-error openclaw plugin SDK is provided by the host at build/runtime.
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 // @ts-expect-error typebox is provided by the host at build/runtime.
 import { Type } from "@sinclair/typebox";
+// @ts-expect-error openclaw plugin SDK is provided by the host at build/runtime.
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 type TaskStatus = "pending" | "running" | "completed" | "skipped" | "blocked";
 type DecisionPolicy = "auto" | "deliberate" | "confirm" | "notify";
@@ -54,8 +54,13 @@ interface FlowLike {
   revision?: number;
   stateJson?: unknown;
   controllerId?: string;
-  createManaged?: (input: Record<string, unknown>) => { flowId?: string; revision?: number } | Promise<{ flowId?: string; revision?: number }>;
-  updateManaged?: (input: { revision?: number; stateJson?: unknown }) => { revision?: number } | Promise<{ revision?: number }>;
+  createManaged?: (
+    input: Record<string, unknown>,
+  ) => { flowId?: string; revision?: number } | Promise<{ flowId?: string; revision?: number }>;
+  updateManaged?: (input: {
+    revision?: number;
+    stateJson?: unknown;
+  }) => { revision?: number } | Promise<{ revision?: number }>;
   runTask?: (input: Record<string, unknown>) => unknown;
   setWaiting?: (input?: Record<string, unknown>) => unknown;
   resume?: (input?: Record<string, unknown>) => unknown;
@@ -75,7 +80,12 @@ type PromptBuildEvent = {
 const PLUGIN_ID = "structured-workflow";
 const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"];
 const ACTIVATION_KEYWORDS = ["ultrawork", "ulw", "task-driven"];
-const COMPLEXITY_HINTS = [/\n/, /\b(step|steps|phase|phases|first|next|then|after that|finally)\b/i, /[•*-]\s+/, /\d+[.)]\s+/];
+const COMPLEXITY_HINTS = [
+  /\n/,
+  /\b(step|steps|phase|phases|first|next|then|after that|finally)\b/i,
+  /[•*-]\s+/,
+  /\d+[.)]\s+/,
+];
 
 export default definePluginEntry({
   id: PLUGIN_ID,
@@ -100,10 +110,10 @@ export default definePluginEntry({
                 Type.Literal("deliberate"),
                 Type.Literal("confirm"),
                 Type.Literal("notify"),
-              ])
+              ]),
             ),
             deliberateWith: Type.Optional(Type.Array(Type.String())),
-          })
+          }),
         ),
       }),
       async execute(_id: string, params: any, ctx: ToolContext) {
@@ -123,12 +133,14 @@ export default definePluginEntry({
           updatedAt: now,
         };
 
-        const created = await maybeAwait(taskFlow.createManaged?.({
-          controllerId: `${PLUGIN_ID}/tasklist`,
-          goal: params.title,
-          currentStep: "create task list",
-          stateJson: state,
-        }));
+        const created = await maybeAwait(
+          taskFlow.createManaged?.({
+            controllerId: `${PLUGIN_ID}/tasklist`,
+            goal: params.title,
+            currentStep: "create task list",
+            stateJson: state,
+          }),
+        );
 
         const flowId = created?.flowId ?? taskFlow.flowId ?? "unknown";
         const revision = created?.revision ?? taskFlow.revision;
@@ -139,7 +151,7 @@ export default definePluginEntry({
             `Flow: ${flowId}${revision !== undefined ? ` (rev ${revision})` : ""}`,
             "",
             formatTaskList(state),
-          ].join("\n")
+          ].join("\n"),
         );
       },
     });
@@ -168,8 +180,14 @@ export default definePluginEntry({
         const current = readWorkflowState(taskFlow.stateJson);
         if (!current) return toolError("Workflow state is missing or invalid.");
 
-        if (params.expectedRevision !== undefined && taskFlow.revision !== undefined && params.expectedRevision !== taskFlow.revision) {
-          return toolError(`Revision conflict: expected ${params.expectedRevision}, current ${taskFlow.revision}.`);
+        if (
+          params.expectedRevision !== undefined &&
+          taskFlow.revision !== undefined &&
+          params.expectedRevision !== taskFlow.revision
+        ) {
+          return toolError(
+            `Revision conflict: expected ${params.expectedRevision}, current ${taskFlow.revision}.`,
+          );
         }
 
         const next = cloneWorkflowState(current);
@@ -180,30 +198,44 @@ export default definePluginEntry({
         if (params.assignedAgent !== undefined) target.assignedAgent = params.assignedAgent;
         if (params.sessionKey !== undefined) target.sessionKey = params.sessionKey;
         if (params.evidence !== undefined) target.evidence = params.evidence;
-        if (params.status === "completed" || params.status === "skipped" || params.status === "blocked") {
+        if (
+          params.status === "completed" ||
+          params.status === "skipped" ||
+          params.status === "blocked"
+        ) {
           target.completedAt = new Date().toISOString();
         }
         next.updatedAt = new Date().toISOString();
 
-        const updated = await maybeAwait(taskFlow.updateManaged?.({ revision: taskFlow.revision, stateJson: next }));
-        const nextRevision = updated?.revision ?? (typeof taskFlow.revision === "number" ? taskFlow.revision + 1 : undefined);
+        const updated = await maybeAwait(
+          taskFlow.updateManaged?.({ revision: taskFlow.revision, stateJson: next }),
+        );
+        const nextRevision =
+          updated?.revision ??
+          (typeof taskFlow.revision === "number" ? taskFlow.revision + 1 : undefined);
 
         if (params.status === "running" && params.sessionKey) {
-          await maybeAwait(taskFlow.runTask?.({
-            taskId: params.taskId,
-            sessionKey: params.sessionKey,
-            assignedAgent: params.assignedAgent,
-            flowId: params.flowId ?? taskFlow.flowId,
-          }));
+          await maybeAwait(
+            taskFlow.runTask?.({
+              taskId: params.taskId,
+              sessionKey: params.sessionKey,
+              assignedAgent: params.assignedAgent,
+              flowId: params.flowId ?? taskFlow.flowId,
+            }),
+          );
         }
 
-        return textResult([
-          `✅ Task ${params.taskId} → ${params.status}`,
-          params.assignedAgent ? `Assigned agent: ${params.assignedAgent}` : null,
-          params.sessionKey ? `Session: ${params.sessionKey}` : null,
-          params.evidence ? `Evidence: ${params.evidence}` : null,
-          nextRevision !== undefined ? `Revision: ${nextRevision}` : null,
-        ].filter(Boolean).join("\n"));
+        return textResult(
+          [
+            `✅ Task ${params.taskId} → ${params.status}`,
+            params.assignedAgent ? `Assigned agent: ${params.assignedAgent}` : null,
+            params.sessionKey ? `Session: ${params.sessionKey}` : null,
+            params.evidence ? `Evidence: ${params.evidence}` : null,
+            nextRevision !== undefined ? `Revision: ${nextRevision}` : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
       },
     });
 
@@ -247,27 +279,46 @@ export default definePluginEntry({
       const config = readConfig(api);
       if (config.forceContinuation === false) return {};
 
-      const incomingText = [event.context?.bodyForAgent, event.context?.incomingMessage].filter(Boolean).join("\n");
-      if (containsKeyword(incomingText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS)) return {};
+      const incomingText = [event.context?.bodyForAgent, event.context?.incomingMessage]
+        .filter(Boolean)
+        .join("\n");
+      if (containsKeyword(incomingText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS))
+        return {};
 
-      const previous = [event.context?.lastAgentResponse, event.context?.latestAssistantMessage].filter(Boolean).join("\n");
+      const previous = [event.context?.lastAgentResponse, event.context?.latestAssistantMessage]
+        .filter(Boolean)
+        .join("\n");
       if (/STOP_REQUEST/.test(previous)) return {};
 
       const taskFlow = findActiveWorkflow(api, event);
       const state = taskFlow ? readWorkflowState(taskFlow.stateJson) : undefined;
-      const incomplete = state?.tasks.filter((task) => task.status === "pending" || task.status === "running") ?? [];
+      const incomplete =
+        state?.tasks.filter((task) => task.status === "pending" || task.status === "running") ?? [];
       if (!state || incomplete.length === 0) return {};
 
       return {
         prependSystemContext: buildContinuationContext(state, incomplete),
       };
     });
-
   },
 });
 
-function readConfig(api: Record<string, unknown>): Required<Pick<PluginConfig, "permissionMode" | "deliberateDefaultAgents" | "deliberateMaxRounds" | "forceContinuation" | "cancelKeywords" | "flowDetectionMode" | "activationKeywords">> {
-  const cfg = typeof api.getConfig === "function" ? (api.getConfig() as PluginConfig | undefined) : undefined;
+function readConfig(
+  api: Record<string, unknown>,
+): Required<
+  Pick<
+    PluginConfig,
+    | "permissionMode"
+    | "deliberateDefaultAgents"
+    | "deliberateMaxRounds"
+    | "forceContinuation"
+    | "cancelKeywords"
+    | "flowDetectionMode"
+    | "activationKeywords"
+  >
+> {
+  const cfg =
+    typeof api.getConfig === "function" ? (api.getConfig() as PluginConfig | undefined) : undefined;
   return {
     permissionMode: cfg?.permissionMode ?? "bypass",
     deliberateDefaultAgents: cfg?.deliberateDefaultAgents ?? [],
@@ -283,11 +334,16 @@ function getTaskFlow(api: Record<string, unknown>, ctx: ToolContext): FlowLike |
   return (api as any).runtime?.tasks?.flow?.fromToolContext?.(ctx) as FlowLike | undefined;
 }
 
-function findActiveWorkflow(api: Record<string, unknown>, event: PromptBuildEvent): FlowLike | undefined {
+function findActiveWorkflow(
+  api: Record<string, unknown>,
+  event: PromptBuildEvent,
+): FlowLike | undefined {
   const ctx = event.context as ToolContext | undefined;
   if (!ctx) return undefined;
-  return (api as any).runtime?.tasks?.flow?.fromPromptContext?.(ctx) as FlowLike | undefined
-    ?? (api as any).runtime?.tasks?.flow?.fromEvent?.(event) as FlowLike | undefined;
+  return (
+    ((api as any).runtime?.tasks?.flow?.fromPromptContext?.(ctx) as FlowLike | undefined) ??
+    ((api as any).runtime?.tasks?.flow?.fromEvent?.(event) as FlowLike | undefined)
+  );
 }
 
 function readWorkflowState(value: unknown): WorkflowState | undefined {
@@ -299,13 +355,18 @@ function readWorkflowState(value: unknown): WorkflowState | undefined {
     title: String(state.title ?? "Workflow"),
     tasks: state.tasks.map(normalizeTask),
     permissionMode: (state.permissionMode ?? "bypass") as PermissionMode,
-    allowedOperations: Array.isArray(state.allowedOperations) ? state.allowedOperations.map(String) : [],
+    allowedOperations: Array.isArray(state.allowedOperations)
+      ? state.allowedOperations.map(String)
+      : [],
     createdAt: String(state.createdAt ?? new Date().toISOString()),
     updatedAt: String(state.updatedAt ?? new Date().toISOString()),
   };
 }
 
-function normalizeTasks(tasks: Array<Partial<TaskItem>>, config: ReturnType<typeof readConfig>): TaskItem[] {
+function normalizeTasks(
+  tasks: Array<Partial<TaskItem>>,
+  config: ReturnType<typeof readConfig>,
+): TaskItem[] {
   return tasks.map((task) => ({
     id: String(task.id),
     title: String(task.title),
@@ -337,7 +398,10 @@ function normalizeTask(task: Partial<TaskItem>): TaskItem {
   };
 }
 
-function inferDecisionPolicy(task: Partial<TaskItem>, config: ReturnType<typeof readConfig>): DecisionPolicy {
+function inferDecisionPolicy(
+  task: Partial<TaskItem>,
+  config: ReturnType<typeof readConfig>,
+): DecisionPolicy {
   if ((task.deliberateWith?.length ?? 0) > 0) return "deliberate";
   if ((task.title ?? "").match(/review|approve|confirm|security|deploy|money/i)) return "confirm";
   if (config.permissionMode === "confirm-each") return "confirm";
@@ -356,7 +420,10 @@ function findTask(tasks: TaskItem[], taskId: string): TaskItem | undefined {
 function cloneWorkflowState(state: WorkflowState): WorkflowState {
   return {
     ...state,
-    tasks: state.tasks.map((task) => ({ ...task, subTasks: task.subTasks?.map((sub) => ({ ...sub })) })),
+    tasks: state.tasks.map((task) => ({
+      ...task,
+      subTasks: task.subTasks?.map((sub) => ({ ...sub })),
+    })),
     allowedOperations: [...state.allowedOperations],
   };
 }
@@ -380,8 +447,15 @@ function formatTaskList(state: WorkflowState, flowId?: string, revision?: number
 function renderTask(task: TaskItem, depth: number): string {
   const indent = "  ".repeat(depth);
   const policy = task.decisionPolicy !== "auto" ? ` [${task.decisionPolicy}]` : "";
-  const meta = [task.assignedAgent ? `agent=${task.assignedAgent}` : null, task.sessionKey ? `session=${task.sessionKey}` : null].filter(Boolean).join(", ");
-  const lines = [`${indent}${STATUS_ICONS[task.status]} ${task.id}. ${task.title}${policy}${meta ? ` (${meta})` : ""}`];
+  const meta = [
+    task.assignedAgent ? `agent=${task.assignedAgent}` : null,
+    task.sessionKey ? `session=${task.sessionKey}` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const lines = [
+    `${indent}${STATUS_ICONS[task.status]} ${task.id}. ${task.title}${policy}${meta ? ` (${meta})` : ""}`,
+  ];
   if (task.description) lines.push(`${indent}  ${task.description}`);
   if (task.evidence) lines.push(`${indent}  evidence: ${task.evidence}`);
   for (const sub of task.subTasks ?? []) lines.push(renderTask(sub, depth + 1));
@@ -415,7 +489,7 @@ function containsKeyword(text: string, keywords: string[]): boolean {
   return keywords.some((keyword) => normalized.includes(keyword.toLowerCase()));
 }
 
-function shouldActivateFlow(text: string, config: ReturnType<typeof readConfig>): boolean {
+function _shouldActivateFlow(text: string, config: ReturnType<typeof readConfig>): boolean {
   if (config.flowDetectionMode === "keyword-only") {
     return containsKeyword(text, config.activationKeywords);
   }

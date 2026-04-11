@@ -5,9 +5,17 @@
   "description": "Task-list driven workflow plugin for OpenClaw. Structured decomposition, decision policies, permission modes, and forced continuation on TaskFlow.",
   "license": "MIT",
   "repository": "https://github.com/tontoko/openclaw-structured-workflow",
-  "keywords": ["openclaw", "plugin", "workflow", "taskflow", "ultrawork"],
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "workflow",
+    "taskflow",
+    "ultrawork"
+  ],
   "openclaw": {
-    "extensions": ["./src/index.ts"],
+    "extensions": [
+      "./src/index.ts"
+    ],
     "compat": {
       "pluginApi": ">=2026.3.24-beta.2",
       "minGatewayVersion": "2026.3.24-beta.2"
@@ -16,5 +24,9 @@
       "openclawVersion": "2026.4.9",
       "pluginSdkVersion": "2026.4.9"
     }
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2",
+    "ultracite": "^7.4.4"
   }
 }
