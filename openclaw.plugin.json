@@ -1,0 +1,51 @@
+{
+  "id": "structured-workflow",
+  "name": "Structured Workflow",
+  "description": "Task-list driven workflow with structured decomposition, decision policies (auto/deliberate/confirm/notify), permission modes (bypass/allow-after-first/confirm-each), and forced continuation. Built on TaskFlow for durability across restarts.",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "permissionMode": {
+        "type": "string",
+        "enum": ["bypass", "allow-after-first", "confirm-each"],
+        "default": "bypass",
+        "description": "Permission mode for task execution"
+      },
+      "deliberateDefaultAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Default agents for deliberate (discussion) tasks"
+      },
+      "deliberateMaxRounds": {
+        "type": "number",
+        "default": 3,
+        "description": "Maximum discussion rounds for deliberate tasks"
+      },
+      "forceContinuation": {
+        "type": "boolean",
+        "default": true,
+        "description": "Force continuation when incomplete tasks remain"
+      },
+      "cancelKeywords": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"],
+        "description": "Keywords that always override forced continuation"
+      },
+      "flowDetectionMode": {
+        "type": "string",
+        "enum": ["auto", "keyword-only"],
+        "default": "auto",
+        "description": "How to detect if a message needs task decomposition"
+      },
+      "activationKeywords": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["ultrawork", "ulw", "task-driven"],
+        "description": "Keywords that force task decomposition (when flowDetectionMode is keyword-only)"
+      }
+    },
+    "additionalProperties": false
+  }
+}
