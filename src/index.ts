@@ -386,7 +386,11 @@ function readConfig(
 }
 
 function getTaskFlow(api: Record<string, unknown>, ctx: ToolContext): FlowLike | undefined {
-  return (api as any).runtime?.tasks?.flow?.fromToolContext?.(ctx) as FlowLike | undefined;
+  try {
+    return (api as any).runtime?.tasks?.flow?.fromToolContext?.(ctx) as FlowLike | undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function findActiveWorkflow(
