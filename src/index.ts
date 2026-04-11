@@ -5,24 +5,27 @@
  * and forced continuation. Built on TaskFlow for durability.
  */
 
+// @ts-expect-error openclaw plugin SDK is provided by the host at build/runtime.
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+// @ts-expect-error typebox is provided by the host at build/runtime.
 import { Type } from "@sinclair/typebox";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+type TaskStatus = "pending" | "running" | "completed" | "skipped" | "blocked";
+type DecisionPolicy = "auto" | "deliberate" | "confirm" | "notify";
+type PermissionMode = "bypass" | "allow-after-first" | "confirm-each";
+type FlowDetectionMode = "auto" | "keyword-only";
 
 interface TaskItem {
   id: string;
   title: string;
   description?: string;
-  status: "pending" | "running" | "completed" | "skipped" | "blocked";
-  decisionPolicy: "auto" | "deliberate" | "confirm" | "notify";
-  deliberateWith?: string[];  // agent IDs for deliberate tasks
-  assignedAgent?: string;
-  sessionKey?: string;
-  completedAt?: string;
-  evidence?: string;
+  status: TaskStatus;
+  decisionPolicy: DecisionPolicy;
+  deliberateWith?: string[];
+  assignedAgent?: string | null;
+  sessionKey?: string | null;
+  completedAt?: string | null;
+  evidence?: string | null;
   subTasks?: TaskItem[];
 }
 
@@ -30,189 +33,200 @@ interface WorkflowState {
   type: "workflow";
   title: string;
   tasks: TaskItem[];
-  permissionMode: "bypass" | "allow-after-first" | "confirm-each";
-  allowedOperations: Set<string>; // for allow-after-first mode
+  permissionMode: PermissionMode;
+  allowedOperations: string[];
   createdAt: string;
   updatedAt: string;
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+interface PluginConfig {
+  permissionMode?: PermissionMode;
+  deliberateDefaultAgents?: string[];
+  deliberateMaxRounds?: number;
+  forceContinuation?: boolean;
+  cancelKeywords?: string[];
+  flowDetectionMode?: FlowDetectionMode;
+  activationKeywords?: string[];
+}
+
+interface FlowLike {
+  flowId?: string;
+  revision?: number;
+  stateJson?: unknown;
+  controllerId?: string;
+  createManaged?: (input: Record<string, unknown>) => { flowId?: string; revision?: number } | Promise<{ flowId?: string; revision?: number }>;
+  updateManaged?: (input: { revision?: number; stateJson?: unknown }) => { revision?: number } | Promise<{ revision?: number }>;
+  runTask?: (input: Record<string, unknown>) => unknown;
+  setWaiting?: (input?: Record<string, unknown>) => unknown;
+  resume?: (input?: Record<string, unknown>) => unknown;
+  finish?: (input?: Record<string, unknown>) => unknown;
+}
+
+type ToolContext = Record<string, unknown>;
+type PromptBuildEvent = {
+  context?: {
+    bodyForAgent?: string;
+    incomingMessage?: string;
+    lastAgentResponse?: string;
+    latestAssistantMessage?: string;
+  } & Record<string, unknown>;
+} & Record<string, unknown>;
 
 const PLUGIN_ID = "structured-workflow";
-
-const DEFAULT_CANCEL_KEYWORDS = [
-  "/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop",
-];
-
+const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"];
 const ACTIVATION_KEYWORDS = ["ultrawork", "ulw", "task-driven"];
-
-// ---------------------------------------------------------------------------
-// Plugin Entry
-// ---------------------------------------------------------------------------
+const COMPLEXITY_HINTS = [/\n/, /\b(step|steps|phase|phases|first|next|then|after that|finally)\b/i, /[•*-]\s+/, /\d+[.)]\s+/];
 
 export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Structured Workflow",
   description:
-    "Task-list driven workflow with structured decomposition, decision policies, and forced continuation.",
+    "Task-list driven workflow with structured decomposition, decision policies, permission modes, and forced continuation.",
 
-  register(api) {
-    // -----------------------------------------------------------------------
-    // Tool: tasklist_create
-    // -----------------------------------------------------------------------
+  register(api: any) {
     api.registerTool({
       name: "tasklist_create",
-      description:
-        "Create a structured task list for a complex instruction. " +
-        "Decomposes work into phased tasks with decision policies. " +
-        "Use when the instruction requires multiple steps (research, design, implement, test, verify).",
+      description: "Create a structured task list for a complex instruction.",
       parameters: Type.Object({
-        title: Type.String({ description: "Brief title for the workflow" }),
+        title: Type.String(),
         tasks: Type.Array(
           Type.Object({
             id: Type.String(),
             title: Type.String(),
             description: Type.Optional(Type.String()),
-            decisionPolicy: Type.Union([
-              Type.Literal("auto"),
-              Type.Literal("deliberate"),
-              Type.Literal("confirm"),
-              Type.Literal("notify"),
-            ]),
+            decisionPolicy: Type.Optional(
+              Type.Union([
+                Type.Literal("auto"),
+                Type.Literal("deliberate"),
+                Type.Literal("confirm"),
+                Type.Literal("notify"),
+              ])
+            ),
             deliberateWith: Type.Optional(Type.Array(Type.String())),
           })
         ),
       }),
-      async execute(_id, params, ctx) {
-        const taskFlow = api.runtime?.tasks?.flow?.fromToolContext?.(ctx);
-        if (!taskFlow) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: TaskFlow runtime not available.",
-              },
-            ],
-          };
-        }
+      async execute(_id: string, params: any, ctx: ToolContext) {
+        const taskFlow = getTaskFlow(api, ctx);
+        if (!taskFlow) return toolError("TaskFlow runtime not available.");
 
-        const tasks: TaskItem[] = params.tasks.map((t) => ({
-          ...t,
-          status: "pending" as const,
-        }));
-
+        const config = readConfig(api);
         const now = new Date().toISOString();
+        const tasks = normalizeTasks(params.tasks, config);
         const state: WorkflowState = {
           type: "workflow",
           title: params.title,
           tasks,
-          permissionMode: "bypass", // from config in real impl
-          allowedOperations: new Set(),
+          permissionMode: config.permissionMode ?? "bypass",
+          allowedOperations: [],
           createdAt: now,
           updatedAt: now,
         };
 
-        const created = taskFlow.createManaged({
+        const created = await maybeAwait(taskFlow.createManaged?.({
           controllerId: `${PLUGIN_ID}/tasklist`,
           goal: params.title,
-          currentStep: "execute",
-          stateJson: JSON.parse(JSON.stringify(state)),
-        });
+          currentStep: "create task list",
+          stateJson: state,
+        }));
 
-        const taskListMd = formatTaskList(params.title, tasks);
+        const flowId = created?.flowId ?? taskFlow.flowId ?? "unknown";
+        const revision = created?.revision ?? taskFlow.revision;
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `📋 Task list created (flow: ${created.flowId})\n\n${taskListMd}`,
-            },
-          ],
-        };
+        return textResult(
+          [
+            `📋 Task list created`,
+            `Flow: ${flowId}${revision !== undefined ? ` (rev ${revision})` : ""}`,
+            "",
+            formatTaskList(state),
+          ].join("\n")
+        );
       },
     });
 
-    // -----------------------------------------------------------------------
-    // Tool: tasklist_update
-    // -----------------------------------------------------------------------
     api.registerTool({
       name: "tasklist_update",
-      description:
-        "Update a task's status in the workflow. Provide evidence for completion.",
+      description: "Update a task's status in the workflow.",
       parameters: Type.Object({
-        flowId: Type.String({ description: "The flow ID to update" }),
-        taskId: Type.String({ description: "Task ID to update" }),
+        flowId: Type.Optional(Type.String()),
+        taskId: Type.String(),
         status: Type.Union([
           Type.Literal("running"),
           Type.Literal("completed"),
           Type.Literal("skipped"),
           Type.Literal("blocked"),
         ]),
-        evidence: Type.Optional(
-          Type.String({ description: "Evidence of completion or reason for skip/block" })
-        ),
+        expectedRevision: Type.Optional(Type.Number()),
+        evidence: Type.Optional(Type.String()),
         assignedAgent: Type.Optional(Type.String()),
         sessionKey: Type.Optional(Type.String()),
       }),
-      async execute(_id, params, ctx) {
-        const taskFlow = api.runtime?.tasks?.flow?.fromToolContext?.(ctx);
-        if (!taskFlow) {
-          return {
-            content: [
-              { type: "text" as const, text: "Error: TaskFlow runtime not available." },
-            ],
-          };
+      async execute(_id: string, params: any, ctx: ToolContext) {
+        const taskFlow = getTaskFlow(api, ctx);
+        if (!taskFlow) return toolError("TaskFlow runtime not available.");
+
+        const current = readWorkflowState(taskFlow.stateJson);
+        if (!current) return toolError("Workflow state is missing or invalid.");
+
+        if (params.expectedRevision !== undefined && taskFlow.revision !== undefined && params.expectedRevision !== taskFlow.revision) {
+          return toolError(`Revision conflict: expected ${params.expectedRevision}, current ${taskFlow.revision}.`);
         }
 
-        // In real impl: read flow, update stateJson, write back with revision
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `✅ Task ${params.taskId} → ${params.status}${params.evidence ? `\nEvidence: ${params.evidence}` : ""}`,
-            },
-          ],
-        };
+        const next = cloneWorkflowState(current);
+        const target = findTask(next.tasks, params.taskId);
+        if (!target) return toolError(`Task not found: ${params.taskId}`);
+
+        target.status = params.status;
+        if (params.assignedAgent !== undefined) target.assignedAgent = params.assignedAgent;
+        if (params.sessionKey !== undefined) target.sessionKey = params.sessionKey;
+        if (params.evidence !== undefined) target.evidence = params.evidence;
+        if (params.status === "completed" || params.status === "skipped" || params.status === "blocked") {
+          target.completedAt = new Date().toISOString();
+        }
+        next.updatedAt = new Date().toISOString();
+
+        const updated = await maybeAwait(taskFlow.updateManaged?.({ revision: taskFlow.revision, stateJson: next }));
+        const nextRevision = updated?.revision ?? (typeof taskFlow.revision === "number" ? taskFlow.revision + 1 : undefined);
+
+        if (params.status === "running" && params.sessionKey) {
+          await maybeAwait(taskFlow.runTask?.({
+            taskId: params.taskId,
+            sessionKey: params.sessionKey,
+            assignedAgent: params.assignedAgent,
+            flowId: params.flowId ?? taskFlow.flowId,
+          }));
+        }
+
+        return textResult([
+          `✅ Task ${params.taskId} → ${params.status}`,
+          params.assignedAgent ? `Assigned agent: ${params.assignedAgent}` : null,
+          params.sessionKey ? `Session: ${params.sessionKey}` : null,
+          params.evidence ? `Evidence: ${params.evidence}` : null,
+          nextRevision !== undefined ? `Revision: ${nextRevision}` : null,
+        ].filter(Boolean).join("\n"));
       },
     });
 
-    // -----------------------------------------------------------------------
-    // Tool: tasklist_status
-    // -----------------------------------------------------------------------
     api.registerTool({
       name: "tasklist_status",
       description: "Show current task list status for a workflow.",
       parameters: Type.Object({
-        flowId: Type.String({ description: "The flow ID to inspect" }),
+        flowId: Type.Optional(Type.String()),
       }),
-      async execute(_id, params, ctx) {
-        const taskFlow = api.runtime?.tasks?.flow?.fromToolContext?.(ctx);
-        if (!taskFlow) {
-          return {
-            content: [
-              { type: "text" as const, text: "Error: TaskFlow runtime not available." },
-            ],
-          };
-        }
+      async execute(_id: string, params: any, ctx: ToolContext) {
+        const taskFlow = getTaskFlow(api, ctx);
+        if (!taskFlow) return toolError("TaskFlow runtime not available.");
 
-        // In real impl: read flow stateJson and format
-        return {
-          content: [
-            { type: "text" as const, text: `Flow ${params.flowId} status: (placeholder)` },
-          ],
-        };
+        const state = readWorkflowState(taskFlow.stateJson);
+        if (!state) return toolError("Workflow state is missing or invalid.");
+        const revision = taskFlow.revision;
+        return textResult(formatTaskList(state, params.flowId ?? taskFlow.flowId, revision));
       },
     });
 
-    // -----------------------------------------------------------------------
-    // Tool: tasklist_permission
-    // -----------------------------------------------------------------------
     api.registerTool({
       name: "tasklist_permission",
-      description:
-        "Switch permission mode. Modes: bypass (no confirmation), allow-after-first (confirm once per type), confirm-each (confirm every step).",
+      description: "Switch permission mode.",
       parameters: Type.Object({
         mode: Type.Union([
           Type.Literal("bypass"),
@@ -220,80 +234,211 @@ export default definePluginEntry({
           Type.Literal("confirm-each"),
         ]),
       }),
-      async execute(_id, params) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `🔐 Permission mode set to: ${params.mode}`,
-            },
-          ],
-        };
+      async execute(_id: string, params: any) {
+        if (typeof api.updateConfig !== "function") {
+          return toolError("Config update is not available in this runtime.");
+        }
+        await maybeAwait(api.updateConfig({ permissionMode: params.mode }));
+        return textResult(`🔐 Permission mode set to: ${params.mode}`);
       },
     });
 
-    // -----------------------------------------------------------------------
-    // Hook: before_prompt_build — forced continuation
-    // -----------------------------------------------------------------------
-    api.on("before_prompt_build", async (event) => {
-      // Check if there's an active workflow with incomplete tasks
-      // If so, inject continuation instructions
-      // Cancel keywords always take priority
+    api.on("before_prompt_build", async (event: PromptBuildEvent) => {
+      const config = readConfig(api);
+      if (config.forceContinuation === false) return {};
 
-      const config = api.getConfig?.() as Record<string, unknown> | undefined;
-      const forceContinuation = (config?.forceContinuation ?? true) as boolean;
-      if (!forceContinuation) return;
+      const incomingText = [event.context?.bodyForAgent, event.context?.incomingMessage].filter(Boolean).join("\n");
+      if (containsKeyword(incomingText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS)) return {};
 
-      const cancelKeywords = (
-        (config?.cancelKeywords as string[]) ?? DEFAULT_CANCEL_KEYWORDS
-      );
+      const previous = [event.context?.lastAgentResponse, event.context?.latestAssistantMessage].filter(Boolean).join("\n");
+      if (/STOP_REQUEST/.test(previous)) return {};
 
-      // Check for cancel keywords in the incoming message
-      const incomingText = (event as any).context?.bodyForAgent ?? "";
-      if (
-        cancelKeywords.some((kw) =>
-          incomingText.toLowerCase().includes(kw.toLowerCase())
-        )
-      ) {
-        // Let the cancel through
-        return;
-      }
+      const taskFlow = findActiveWorkflow(api, event);
+      const state = taskFlow ? readWorkflowState(taskFlow.stateJson) : undefined;
+      const incomplete = state?.tasks.filter((task) => task.status === "pending" || task.status === "running") ?? [];
+      if (!state || incomplete.length === 0) return {};
 
-      // In real impl: check active TaskFlow for incomplete tasks
-      // If found, prepend continuation instructions
-      // return { prependSystemContext: "..." };
+      return {
+        prependSystemContext: buildContinuationContext(state, incomplete),
+      };
     });
+
   },
 });
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+function readConfig(api: Record<string, unknown>): Required<Pick<PluginConfig, "permissionMode" | "deliberateDefaultAgents" | "deliberateMaxRounds" | "forceContinuation" | "cancelKeywords" | "flowDetectionMode" | "activationKeywords">> {
+  const cfg = typeof api.getConfig === "function" ? (api.getConfig() as PluginConfig | undefined) : undefined;
+  return {
+    permissionMode: cfg?.permissionMode ?? "bypass",
+    deliberateDefaultAgents: cfg?.deliberateDefaultAgents ?? [],
+    deliberateMaxRounds: cfg?.deliberateMaxRounds ?? 3,
+    forceContinuation: cfg?.forceContinuation ?? true,
+    cancelKeywords: cfg?.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS,
+    flowDetectionMode: cfg?.flowDetectionMode ?? "auto",
+    activationKeywords: cfg?.activationKeywords ?? ACTIVATION_KEYWORDS,
+  };
+}
 
-const STATUS_ICONS: Record<TaskItem["status"], string> = {
+function getTaskFlow(api: Record<string, unknown>, ctx: ToolContext): FlowLike | undefined {
+  return (api as any).runtime?.tasks?.flow?.fromToolContext?.(ctx) as FlowLike | undefined;
+}
+
+function findActiveWorkflow(api: Record<string, unknown>, event: PromptBuildEvent): FlowLike | undefined {
+  const ctx = event.context as ToolContext | undefined;
+  if (!ctx) return undefined;
+  return (api as any).runtime?.tasks?.flow?.fromPromptContext?.(ctx) as FlowLike | undefined
+    ?? (api as any).runtime?.tasks?.flow?.fromEvent?.(event) as FlowLike | undefined;
+}
+
+function readWorkflowState(value: unknown): WorkflowState | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const state = value as Partial<WorkflowState>;
+  if (state.type !== "workflow" || !Array.isArray(state.tasks)) return undefined;
+  return {
+    type: "workflow",
+    title: String(state.title ?? "Workflow"),
+    tasks: state.tasks.map(normalizeTask),
+    permissionMode: (state.permissionMode ?? "bypass") as PermissionMode,
+    allowedOperations: Array.isArray(state.allowedOperations) ? state.allowedOperations.map(String) : [],
+    createdAt: String(state.createdAt ?? new Date().toISOString()),
+    updatedAt: String(state.updatedAt ?? new Date().toISOString()),
+  };
+}
+
+function normalizeTasks(tasks: Array<Partial<TaskItem>>, config: ReturnType<typeof readConfig>): TaskItem[] {
+  return tasks.map((task) => ({
+    id: String(task.id),
+    title: String(task.title),
+    description: task.description,
+    status: "pending",
+    decisionPolicy: task.decisionPolicy ?? inferDecisionPolicy(task, config),
+    deliberateWith: task.deliberateWith ?? [],
+    assignedAgent: task.assignedAgent ?? null,
+    sessionKey: task.sessionKey ?? null,
+    completedAt: task.completedAt ?? null,
+    evidence: task.evidence ?? null,
+    subTasks: task.subTasks?.map(normalizeTask),
+  }));
+}
+
+function normalizeTask(task: Partial<TaskItem>): TaskItem {
+  return {
+    id: String(task.id ?? ""),
+    title: String(task.title ?? ""),
+    description: task.description,
+    status: (task.status ?? "pending") as TaskStatus,
+    decisionPolicy: (task.decisionPolicy ?? "auto") as DecisionPolicy,
+    deliberateWith: task.deliberateWith ?? [],
+    assignedAgent: task.assignedAgent ?? null,
+    sessionKey: task.sessionKey ?? null,
+    completedAt: task.completedAt ?? null,
+    evidence: task.evidence ?? null,
+    subTasks: task.subTasks?.map(normalizeTask),
+  };
+}
+
+function inferDecisionPolicy(task: Partial<TaskItem>, config: ReturnType<typeof readConfig>): DecisionPolicy {
+  if ((task.deliberateWith?.length ?? 0) > 0) return "deliberate";
+  if ((task.title ?? "").match(/review|approve|confirm|security|deploy|money/i)) return "confirm";
+  if (config.permissionMode === "confirm-each") return "confirm";
+  return "auto";
+}
+
+function findTask(tasks: TaskItem[], taskId: string): TaskItem | undefined {
+  for (const task of tasks) {
+    if (task.id === taskId) return task;
+    const nested = task.subTasks ? findTask(task.subTasks, taskId) : undefined;
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function cloneWorkflowState(state: WorkflowState): WorkflowState {
+  return {
+    ...state,
+    tasks: state.tasks.map((task) => ({ ...task, subTasks: task.subTasks?.map((sub) => ({ ...sub })) })),
+    allowedOperations: [...state.allowedOperations],
+  };
+}
+
+function formatTaskList(state: WorkflowState, flowId?: string, revision?: number): string {
+  const completed = countTasks(state.tasks, (task) => task.status === "completed");
+  const total = countTasks(state.tasks, () => true);
+  const lines = [
+    `📋 TASK LIST: ${state.title}`,
+    flowId ? `Flow: ${flowId}${revision !== undefined ? ` (rev ${revision})` : ""}` : undefined,
+    `Progress: ${completed}/${total} complete`,
+    "",
+  ].filter(Boolean) as string[];
+
+  for (const task of state.tasks) {
+    lines.push(renderTask(task, 0));
+  }
+  return lines.join("\n");
+}
+
+function renderTask(task: TaskItem, depth: number): string {
+  const indent = "  ".repeat(depth);
+  const policy = task.decisionPolicy !== "auto" ? ` [${task.decisionPolicy}]` : "";
+  const meta = [task.assignedAgent ? `agent=${task.assignedAgent}` : null, task.sessionKey ? `session=${task.sessionKey}` : null].filter(Boolean).join(", ");
+  const lines = [`${indent}${STATUS_ICONS[task.status]} ${task.id}. ${task.title}${policy}${meta ? ` (${meta})` : ""}`];
+  if (task.description) lines.push(`${indent}  ${task.description}`);
+  if (task.evidence) lines.push(`${indent}  evidence: ${task.evidence}`);
+  for (const sub of task.subTasks ?? []) lines.push(renderTask(sub, depth + 1));
+  return lines.join("\n");
+}
+
+function countTasks(tasks: TaskItem[], predicate: (task: TaskItem) => boolean): number {
+  let count = 0;
+  for (const task of tasks) {
+    if (predicate(task)) count += 1;
+    if (task.subTasks) count += countTasks(task.subTasks, predicate);
+  }
+  return count;
+}
+
+function buildContinuationContext(state: WorkflowState, incomplete: TaskItem[]): string {
+  const lines = [
+    "Continue the active structured workflow.",
+    `Workflow: ${state.title}`,
+    `Remaining tasks: ${incomplete.length}`,
+    "Focus on the next pending or running task before answering anything else.",
+    "If the user explicitly requested cancellation, honor it instead.",
+    "",
+    ...incomplete.map((task) => `- ${task.id}. ${task.title} (${task.status})`),
+  ];
+  return lines.join("\n");
+}
+
+function containsKeyword(text: string, keywords: string[]): boolean {
+  const normalized = text.toLowerCase();
+  return keywords.some((keyword) => normalized.includes(keyword.toLowerCase()));
+}
+
+function shouldActivateFlow(text: string, config: ReturnType<typeof readConfig>): boolean {
+  if (config.flowDetectionMode === "keyword-only") {
+    return containsKeyword(text, config.activationKeywords);
+  }
+  if (containsKeyword(text, config.activationKeywords)) return true;
+  return COMPLEXITY_HINTS.some((pattern) => pattern.test(text)) && text.length > 80;
+}
+
+function toolError(message: string) {
+  return { content: [{ type: "text" as const, text: `Error: ${message}` }] };
+}
+
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+async function maybeAwait<T>(value: T | Promise<T> | undefined): Promise<T | undefined> {
+  return await value;
+}
+
+const STATUS_ICONS: Record<TaskStatus, string> = {
   pending: "☐",
   running: "🔄",
   completed: "✅",
   skipped: "⏭️",
   blocked: "❌",
 };
-
-function formatTaskList(title: string, tasks: TaskItem[]): string {
-  const lines = [`📋 TASK LIST: ${title}`, ""];
-  let completed = 0;
-
-  for (const task of tasks) {
-    const icon = STATUS_ICONS[task.status];
-    const policy = task.decisionPolicy !== "auto" ? ` [${task.decisionPolicy}]` : "";
-    lines.push(`${icon} ${task.id}. ${task.title}${policy}`);
-    if (task.description) {
-      lines.push(`   ${task.description}`);
-    }
-    if (task.status === "completed") completed++;
-  }
-
-  lines.push("");
-  lines.push(`Status: ${completed}/${tasks.length} complete`);
-
-  return lines.join("\n");
-}
