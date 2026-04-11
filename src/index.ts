@@ -1,8 +1,9 @@
 /**
- * Structured Workflow Plugin for OpenClaw
+ * Structured Workflow Plugin for OpenClaw v0.3.0
  *
- * Task-list driven workflow with decision policies, permission modes,
- * and forced continuation. Built on TaskFlow for durability.
+ * Task-list driven workflow with structured decomposition, decision policies,
+ * permission modes, forced continuation, IntentGate, evidence enforcement,
+ * and override audit logging.
  */
 
 // @ts-expect-error typebox is provided by the host at build/runtime.
@@ -26,6 +27,7 @@ interface TaskItem {
   sessionKey?: string | null;
   completedAt?: string | null;
   evidence?: string | null;
+  blockedReason?: string | null;
   subTasks?: TaskItem[];
 }
 
@@ -37,6 +39,15 @@ interface WorkflowState {
   allowedOperations: string[];
   createdAt: string;
   updatedAt: string;
+  auditLog: AuditEntry[];
+}
+
+interface AuditEntry {
+  timestamp: string;
+  action: string;
+  target: string;
+  reason?: string;
+  previousMode?: string;
 }
 
 interface PluginConfig {
@@ -87,6 +98,7 @@ function pruneStandaloneStore() {
   const toRemove = keys.slice(0, keys.length - MAX_STANDALONE_WORKFLOWS);
   for (const key of toRemove) standaloneStore.delete(key);
 }
+
 const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"];
 const ACTIVATION_KEYWORDS = ["ultrawork", "ulw", "task-driven"];
 const COMPLEXITY_HINTS = [
@@ -96,11 +108,19 @@ const COMPLEXITY_HINTS = [
   /\d+[.)]\s+/,
 ];
 
+// IntentGate: patterns that indicate dangerous or plan-deviating actions
+const DESTRUCTIVE_PATTERNS = [
+  /\b(drop|delete|truncate|remove|destroy|wipe|purge)\s+(table|database|schema|collection|branch)/i,
+  /\b(force\s+push|reset\s+--hard|clean\s+-fdx)/i,
+  /\brm\s+-rf\s+\//i,
+  /\b(production|prod|main|master)\s*(deploy|release|push|merge)/i,
+];
+
 export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Structured Workflow",
   description:
-    "Task-list driven workflow with structured decomposition, decision policies, permission modes, and forced continuation.",
+    "Task-list driven workflow with structured decomposition, decision policies, permission modes, forced continuation, and IntentGate.",
 
   register(api: any) {
     api.registerTool({
@@ -137,6 +157,7 @@ export default definePluginEntry({
           allowedOperations: [],
           createdAt: now,
           updatedAt: now,
+          auditLog: [],
         };
 
         let flowId: string;
@@ -155,7 +176,6 @@ export default definePluginEntry({
           flowId = created?.flowId ?? taskFlow.flowId ?? "unknown";
           revision = created?.revision ?? taskFlow.revision;
         } else {
-          // Standalone fallback — no TaskFlow runtime
           standaloneCounter++;
           pruneStandaloneStore();
           flowId = `standalone-${standaloneCounter}`;
@@ -190,6 +210,7 @@ export default definePluginEntry({
         evidence: Type.Optional(Type.String()),
         assignedAgent: Type.Optional(Type.String()),
         sessionKey: Type.Optional(Type.String()),
+        blockedReason: Type.Optional(Type.String()),
       }),
       async execute(_id: string, params: any, ctx: ToolContext) {
         const taskFlow = getTaskFlow(api, ctx);
@@ -203,7 +224,6 @@ export default definePluginEntry({
           currentRevision = taskFlow.revision;
           activeFlowId = taskFlow.flowId;
         } else {
-          // Standalone: find the most recent workflow in memory
           const latestKey = [...standaloneStore.keys()].pop();
           if (latestKey) {
             const entry = standaloneStore.get(latestKey)!;
@@ -230,10 +250,26 @@ export default definePluginEntry({
         const target = findTask(next.tasks, params.taskId);
         if (!target) return toolError(`Task not found: ${params.taskId}`);
 
+        // IntentGate: warn if completing without evidence
+        const warnings: string[] = [];
+        if (params.status === "completed" && !params.evidence && !target.evidence) {
+          warnings.push(
+            "⚠️ No evidence provided for completed task. Best practice: include evidence of verification.",
+          );
+        }
+
+        // IntentGate: warn if blocked without reason
+        if (params.status === "blocked" && !params.blockedReason) {
+          warnings.push(
+            "⚠️ Task blocked without reason. Provide blockedReason to help unblock later.",
+          );
+        }
+
         target.status = params.status;
         if (params.assignedAgent !== undefined) target.assignedAgent = params.assignedAgent;
         if (params.sessionKey !== undefined) target.sessionKey = params.sessionKey;
         if (params.evidence !== undefined) target.evidence = params.evidence;
+        if (params.blockedReason !== undefined) target.blockedReason = params.blockedReason;
         if (
           params.status === "completed" ||
           params.status === "skipped" ||
@@ -242,6 +278,14 @@ export default definePluginEntry({
           target.completedAt = new Date().toISOString();
         }
         next.updatedAt = new Date().toISOString();
+
+        // Audit log entry
+        next.auditLog.push({
+          timestamp: new Date().toISOString(),
+          action: `task:${params.status}`,
+          target: params.taskId,
+          reason: params.evidence ?? params.blockedReason,
+        });
 
         let nextRevision: number | undefined;
 
@@ -274,7 +318,9 @@ export default definePluginEntry({
             params.assignedAgent ? `Assigned agent: ${params.assignedAgent}` : null,
             params.sessionKey ? `Session: ${params.sessionKey}` : null,
             params.evidence ? `Evidence: ${params.evidence}` : null,
+            params.blockedReason ? `Blocked reason: ${params.blockedReason}` : null,
             nextRevision !== undefined ? `Revision: ${nextRevision}` : null,
+            ...warnings,
           ]
             .filter(Boolean)
             .join("\n"),
@@ -299,7 +345,6 @@ export default definePluginEntry({
           revision = taskFlow.revision;
           flowId = flowId ?? taskFlow.flowId;
         } else {
-          // Standalone fallback
           const key = flowId ?? [...standaloneStore.keys()].pop();
           if (key) {
             const entry = standaloneStore.get(key);
@@ -326,19 +371,41 @@ export default definePluginEntry({
           Type.Literal("allow-after-first"),
           Type.Literal("confirm-each"),
         ]),
+        reason: Type.Optional(Type.String()),
       }),
       async execute(_id: string, params: any) {
+        const previousMode =
+          typeof api.getConfig === "function"
+            ? ((api.getConfig() as PluginConfig)?.permissionMode ?? standalonePermissionMode)
+            : standalonePermissionMode;
+
+        // Audit: log permission change
+        const auditEntry: AuditEntry = {
+          timestamp: new Date().toISOString(),
+          action: "permission_change",
+          target: params.mode,
+          reason: params.reason,
+          previousMode,
+        };
+
         if (typeof api.updateConfig === "function") {
           await maybeAwait(api.updateConfig({ permissionMode: params.mode }));
         } else {
-          // Standalone fallback: store in memory
           standalonePermissionMode = params.mode;
-          // Also update all existing workflows
           for (const [, entry] of standaloneStore) {
             entry.state.permissionMode = params.mode;
+            entry.state.auditLog.push(auditEntry);
           }
         }
-        return textResult(`🔐 Permission mode set to: ${params.mode}`);
+
+        return textResult(
+          [
+            `🔐 Permission mode: ${previousMode} → ${params.mode}`,
+            params.reason ? `Reason: ${params.reason}` : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
       },
     });
 
@@ -348,7 +415,6 @@ export default definePluginEntry({
 
       const incomingText = event.prompt ?? "";
       const messages = event.messages ?? [];
-      // Get last user message
       const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
       const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
       const fullIncomingText = [incomingText, lastUserMsg?.content].filter(Boolean).join("\n");
@@ -358,10 +424,12 @@ export default definePluginEntry({
       const previousText = lastAssistantMsg?.content ?? "";
       if (/STOP_REQUEST/.test(previousText)) return {};
 
+      // IntentGate: detect destructive patterns
+      const intentWarnings = checkIntentGate(fullIncomingText);
+
       const taskFlow = findActiveWorkflow(api, event);
       let state = taskFlow ? readWorkflowState(taskFlow.stateJson) : undefined;
 
-      // Standalone fallback: check in-memory store
       if (!state) {
         const latestKey = [...standaloneStore.keys()].pop();
         if (latestKey) {
@@ -369,16 +437,100 @@ export default definePluginEntry({
           if (entry) state = entry.state;
         }
       }
+
       const incomplete =
         state?.tasks.filter((task) => task.status === "pending" || task.status === "running") ?? [];
-      if (!state || incomplete.length === 0) return {};
+      const blocked = state?.tasks.filter((task) => task.status === "blocked") ?? [];
+
+      if (!state || (incomplete.length === 0 && blocked.length === 0)) {
+        // No active workflow, but still check IntentGate
+        if (intentWarnings.length > 0) {
+          return { prependSystemContext: intentWarnings.join("\n") };
+        }
+        return {};
+      }
 
       return {
-        prependSystemContext: buildContinuationContext(state, incomplete),
+        prependSystemContext: buildEnhancedContinuationContext(
+          state,
+          incomplete,
+          blocked,
+          intentWarnings,
+        ),
       };
     });
   },
 });
+
+// --- IntentGate ---
+
+function checkIntentGate(text: string): string[] {
+  const warnings: string[] = [];
+  for (const pattern of DESTRUCTIVE_PATTERNS) {
+    if (pattern.test(text)) {
+      warnings.push(
+        "⚠️ INTENT GATE: Destructive operation detected. Verify scope, backup exists, and this is intentional before proceeding.",
+      );
+      break;
+    }
+  }
+  return warnings;
+}
+
+// --- Enhanced Continuation Context ---
+
+function buildEnhancedContinuationContext(
+  state: WorkflowState,
+  incomplete: TaskItem[],
+  blocked: TaskItem[],
+  intentWarnings: string[],
+): string {
+  const nextTask = incomplete.find((t) => t.status === "running") ?? incomplete[0];
+  const completedCount = countTasks(state.tasks, (t) => t.status === "completed");
+  const totalCount = countTasks(state.tasks, () => true);
+
+  const lines: string[] = [
+    `🔴 STRUCTURED WORKFLOW ACTIVE — Continue until all tasks complete.`,
+    `Workflow: ${state.title}`,
+    `Progress: ${completedCount}/${totalCount} complete | ${incomplete.length} remaining`,
+    "",
+  ];
+
+  if (nextTask) {
+    lines.push(`▸ NEXT TASK: ${nextTask.id}. ${nextTask.title} (${nextTask.status})`);
+    if (nextTask.description) lines.push(`  ${nextTask.description}`);
+    if (nextTask.decisionPolicy !== "auto") lines.push(`  Policy: ${nextTask.decisionPolicy}`);
+    lines.push("");
+  }
+
+  if (blocked.length > 0) {
+    lines.push("🚫 BLOCKED TASKS:");
+    for (const b of blocked) {
+      lines.push(`  - ${b.id}. ${b.title}${b.blockedReason ? `: ${b.blockedReason}` : ""}`);
+    }
+    lines.push("  → Resolve blockers or skip them before proceeding to remaining tasks.", "");
+  }
+
+  lines.push("Remaining tasks:");
+  for (const task of incomplete) {
+    lines.push(`  ${STATUS_ICONS[task.status]} ${task.id}. ${task.title}`);
+  }
+
+  lines.push("");
+  lines.push("Rules:");
+  lines.push("- Do NOT declare workflow complete until all tasks are completed/skipped.");
+  lines.push("- Provide evidence when completing tasks (test output, URLs, screenshots).");
+  lines.push("- If blocked, explain why and what's needed to unblock.");
+  lines.push("- If user explicitly cancels, honor it immediately.");
+
+  if (intentWarnings.length > 0) {
+    lines.push("", ...intentWarnings);
+  }
+
+  return lines.join("\n");
+}
+
+// --- Utilities ---
 
 function readConfig(
   api: Record<string, unknown>,
@@ -443,6 +595,7 @@ function readWorkflowState(value: unknown): WorkflowState | undefined {
       : [],
     createdAt: String(state.createdAt ?? new Date().toISOString()),
     updatedAt: String(state.updatedAt ?? new Date().toISOString()),
+    auditLog: Array.isArray(state.auditLog) ? state.auditLog : [],
   };
 }
 
@@ -461,6 +614,7 @@ function normalizeTasks(
     sessionKey: task.sessionKey ?? null,
     completedAt: task.completedAt ?? null,
     evidence: task.evidence ?? null,
+    blockedReason: task.blockedReason ?? null,
     subTasks: task.subTasks?.map(normalizeTask),
   }));
 }
@@ -477,6 +631,7 @@ function normalizeTask(task: Partial<TaskItem>): TaskItem {
     sessionKey: task.sessionKey ?? null,
     completedAt: task.completedAt ?? null,
     evidence: task.evidence ?? null,
+    blockedReason: task.blockedReason ?? null,
     subTasks: task.subTasks?.map(normalizeTask),
   };
 }
@@ -508,22 +663,35 @@ function cloneWorkflowState(state: WorkflowState): WorkflowState {
       subTasks: task.subTasks?.map((sub) => ({ ...sub })),
     })),
     allowedOperations: [...state.allowedOperations],
+    auditLog: [...state.auditLog],
   };
 }
 
 function formatTaskList(state: WorkflowState, flowId?: string, revision?: number): string {
   const completed = countTasks(state.tasks, (task) => task.status === "completed");
   const total = countTasks(state.tasks, () => true);
+  const blocked = countTasks(state.tasks, (task) => task.status === "blocked");
   const lines = [
     `📋 TASK LIST: ${state.title}`,
     flowId ? `Flow: ${flowId}${revision !== undefined ? ` (rev ${revision})` : ""}` : undefined,
-    `Progress: ${completed}/${total} complete`,
+    `Progress: ${completed}/${total} complete${blocked > 0 ? ` | ${blocked} blocked` : ""}`,
     "",
   ].filter(Boolean) as string[];
 
   for (const task of state.tasks) {
     lines.push(renderTask(task, 0));
   }
+
+  if (state.auditLog.length > 0) {
+    lines.push("", "📝 Audit Log:");
+    const recent = state.auditLog.slice(-5);
+    for (const entry of recent) {
+      lines.push(
+        `  ${entry.timestamp.slice(11, 19)} ${entry.action} → ${entry.target}${entry.reason ? ` (${entry.reason})` : ""}`,
+      );
+    }
+  }
+
   return lines.join("\n");
 }
 
@@ -541,6 +709,7 @@ function renderTask(task: TaskItem, depth: number): string {
   ];
   if (task.description) lines.push(`${indent}  ${task.description}`);
   if (task.evidence) lines.push(`${indent}  evidence: ${task.evidence}`);
+  if (task.blockedReason) lines.push(`${indent}  blocked: ${task.blockedReason}`);
   for (const sub of task.subTasks ?? []) lines.push(renderTask(sub, depth + 1));
   return lines.join("\n");
 }
@@ -552,19 +721,6 @@ function countTasks(tasks: TaskItem[], predicate: (task: TaskItem) => boolean): 
     if (task.subTasks) count += countTasks(task.subTasks, predicate);
   }
   return count;
-}
-
-function buildContinuationContext(state: WorkflowState, incomplete: TaskItem[]): string {
-  const lines = [
-    "Continue the active structured workflow.",
-    `Workflow: ${state.title}`,
-    `Remaining tasks: ${incomplete.length}`,
-    "Focus on the next pending or running task before answering anything else.",
-    "If the user explicitly requested cancellation, honor it instead.",
-    "",
-    ...incomplete.map((task) => `- ${task.id}. ${task.title} (${task.status})`),
-  ];
-  return lines.join("\n");
 }
 
 function containsKeyword(text: string, keywords: string[]): boolean {
