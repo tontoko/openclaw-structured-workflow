@@ -349,7 +349,7 @@ export default definePluginEntry({
     api.on("before_prompt_build", async (event: PromptBuildEvent) => {
       const config = readConfig(api);
       if (config.forceContinuation === false) return {};
-      console.log(`[structured-workflow] before_prompt_build fired, standaloneStore.size=${standaloneStore.size}, incomingText length=${[event.context?.bodyForAgent, event.context?.incomingMessage].filter(Boolean).join("\n").length}`);
+      console.log(`[structured-workflow] before_prompt_build fired, standaloneStore.size=${standaloneStore.size}, event keys=${Object.keys(event).join(",")}, context keys=${event.context ? Object.keys(event.context).join(",") : "no context"}`);
 
       const incomingText = [event.context?.bodyForAgent, event.context?.incomingMessage]
         .filter(Boolean)
