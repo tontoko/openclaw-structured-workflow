@@ -78,6 +78,10 @@ type PromptBuildEvent = {
 } & Record<string, unknown>;
 
 const PLUGIN_ID = "structured-workflow";
+
+// In-memory fallback when TaskFlow runtime is not available
+const standaloneStore = new Map<string, { state: WorkflowState; revision: number }>();
+let standaloneCounter = 0;
 const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"];
 const ACTIVATION_KEYWORDS = ["ultrawork", "ulw", "task-driven"];
 const COMPLEXITY_HINTS = [
@@ -117,9 +121,6 @@ export default definePluginEntry({
         ),
       }),
       async execute(_id: string, params: any, ctx: ToolContext) {
-        const taskFlow = getTaskFlow(api, ctx);
-        if (!taskFlow) return toolError("TaskFlow runtime not available.");
-
         const config = readConfig(api);
         const now = new Date().toISOString();
         const tasks = normalizeTasks(params.tasks, config);
@@ -133,17 +134,28 @@ export default definePluginEntry({
           updatedAt: now,
         };
 
-        const created = await maybeAwait(
-          taskFlow.createManaged?.({
-            controllerId: `${PLUGIN_ID}/tasklist`,
-            goal: params.title,
-            currentStep: "create task list",
-            stateJson: state,
-          }),
-        );
+        let flowId: string;
+        let revision: number | undefined;
 
-        const flowId = created?.flowId ?? taskFlow.flowId ?? "unknown";
-        const revision = created?.revision ?? taskFlow.revision;
+        const taskFlow = getTaskFlow(api, ctx);
+        if (taskFlow) {
+          const created = await maybeAwait(
+            taskFlow.createManaged?.({
+              controllerId: `${PLUGIN_ID}/tasklist`,
+              goal: params.title,
+              currentStep: "create task list",
+              stateJson: state,
+            }),
+          );
+          flowId = created?.flowId ?? taskFlow.flowId ?? "unknown";
+          revision = created?.revision ?? taskFlow.revision;
+        } else {
+          // Standalone fallback — no TaskFlow runtime
+          standaloneCounter++;
+          flowId = `standalone-${standaloneCounter}`;
+          revision = 1;
+          standaloneStore.set(flowId, { state, revision });
+        }
 
         return textResult(
           [
@@ -175,18 +187,36 @@ export default definePluginEntry({
       }),
       async execute(_id: string, params: any, ctx: ToolContext) {
         const taskFlow = getTaskFlow(api, ctx);
-        if (!taskFlow) return toolError("TaskFlow runtime not available.");
 
-        const current = readWorkflowState(taskFlow.stateJson);
-        if (!current) return toolError("Workflow state is missing or invalid.");
+        let current: WorkflowState | undefined;
+        let currentRevision: number | undefined;
+        let activeFlowId: string | undefined;
+
+        if (taskFlow) {
+          current = readWorkflowState(taskFlow.stateJson);
+          currentRevision = taskFlow.revision;
+          activeFlowId = taskFlow.flowId;
+        } else {
+          // Standalone: find the most recent workflow in memory
+          const latestKey = [...standaloneStore.keys()].pop();
+          if (latestKey) {
+            const entry = standaloneStore.get(latestKey)!;
+            current = entry.state;
+            currentRevision = entry.revision;
+            activeFlowId = latestKey;
+          }
+        }
+
+        if (!current)
+          return toolError("No active workflow found. Create one with tasklist_create first.");
 
         if (
           params.expectedRevision !== undefined &&
-          taskFlow.revision !== undefined &&
-          params.expectedRevision !== taskFlow.revision
+          currentRevision !== undefined &&
+          params.expectedRevision !== currentRevision
         ) {
           return toolError(
-            `Revision conflict: expected ${params.expectedRevision}, current ${taskFlow.revision}.`,
+            `Revision conflict: expected ${params.expectedRevision}, current ${currentRevision}.`,
           );
         }
 
@@ -207,22 +237,29 @@ export default definePluginEntry({
         }
         next.updatedAt = new Date().toISOString();
 
-        const updated = await maybeAwait(
-          taskFlow.updateManaged?.({ revision: taskFlow.revision, stateJson: next }),
-        );
-        const nextRevision =
-          updated?.revision ??
-          (typeof taskFlow.revision === "number" ? taskFlow.revision + 1 : undefined);
+        let nextRevision: number | undefined;
 
-        if (params.status === "running" && params.sessionKey) {
-          await maybeAwait(
-            taskFlow.runTask?.({
-              taskId: params.taskId,
-              sessionKey: params.sessionKey,
-              assignedAgent: params.assignedAgent,
-              flowId: params.flowId ?? taskFlow.flowId,
-            }),
+        if (taskFlow) {
+          const updated = await maybeAwait(
+            taskFlow.updateManaged?.({ revision: currentRevision, stateJson: next }),
           );
+          nextRevision =
+            updated?.revision ??
+            (typeof currentRevision === "number" ? currentRevision + 1 : undefined);
+
+          if (params.status === "running" && params.sessionKey) {
+            await maybeAwait(
+              taskFlow.runTask?.({
+                taskId: params.taskId,
+                sessionKey: params.sessionKey,
+                assignedAgent: params.assignedAgent,
+                flowId: params.flowId ?? activeFlowId,
+              }),
+            );
+          }
+        } else if (activeFlowId) {
+          nextRevision = (currentRevision ?? 0) + 1;
+          standaloneStore.set(activeFlowId, { state: next, revision: nextRevision });
         }
 
         return textResult(
@@ -246,13 +283,31 @@ export default definePluginEntry({
         flowId: Type.Optional(Type.String()),
       }),
       async execute(_id: string, params: any, ctx: ToolContext) {
-        const taskFlow = getTaskFlow(api, ctx);
-        if (!taskFlow) return toolError("TaskFlow runtime not available.");
+        let state: WorkflowState | undefined;
+        let revision: number | undefined;
+        let flowId: string | undefined = params.flowId;
 
-        const state = readWorkflowState(taskFlow.stateJson);
-        if (!state) return toolError("Workflow state is missing or invalid.");
-        const revision = taskFlow.revision;
-        return textResult(formatTaskList(state, params.flowId ?? taskFlow.flowId, revision));
+        const taskFlow = getTaskFlow(api, ctx);
+        if (taskFlow) {
+          state = readWorkflowState(taskFlow.stateJson);
+          revision = taskFlow.revision;
+          flowId = flowId ?? taskFlow.flowId;
+        } else {
+          // Standalone fallback
+          const key = flowId ?? [...standaloneStore.keys()].pop();
+          if (key) {
+            const entry = standaloneStore.get(key);
+            if (entry) {
+              state = entry.state;
+              revision = entry.revision;
+              flowId = key;
+            }
+          }
+        }
+
+        if (!state)
+          return toolError("No active workflow found. Create one with tasklist_create first.");
+        return textResult(formatTaskList(state, flowId, revision));
       },
     });
 
