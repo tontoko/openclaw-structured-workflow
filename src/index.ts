@@ -69,12 +69,8 @@ interface FlowLike {
 
 type ToolContext = Record<string, unknown>;
 type PromptBuildEvent = {
-  context?: {
-    bodyForAgent?: string;
-    incomingMessage?: string;
-    lastAgentResponse?: string;
-    latestAssistantMessage?: string;
-  } & Record<string, unknown>;
+  prompt?: string;
+  messages?: Array<{ role: string; content?: string }>;
 } & Record<string, unknown>;
 
 const PLUGIN_ID = "structured-workflow";
@@ -349,18 +345,21 @@ export default definePluginEntry({
     api.on("before_prompt_build", async (event: PromptBuildEvent) => {
       const config = readConfig(api);
       if (config.forceContinuation === false) return {};
-      console.log(`[structured-workflow] before_prompt_build fired, standaloneStore.size=${standaloneStore.size}, event keys=${Object.keys(event).join(",")}, context keys=${event.context ? Object.keys(event.context).join(",") : "no context"}`);
+      console.log(
+        `[structured-workflow] before_prompt_build fired, standaloneStore.size=${standaloneStore.size}, prompt=${(event.prompt ?? "").slice(0, 50)}`,
+      );
 
-      const incomingText = [event.context?.bodyForAgent, event.context?.incomingMessage]
-        .filter(Boolean)
-        .join("\n");
-      if (containsKeyword(incomingText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS))
+      const incomingText = event.prompt ?? "";
+      const messages = event.messages ?? [];
+      // Get last user message
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+      const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
+      const fullIncomingText = [incomingText, lastUserMsg?.content].filter(Boolean).join("\n");
+      if (containsKeyword(fullIncomingText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS))
         return {};
 
-      const previous = [event.context?.lastAgentResponse, event.context?.latestAssistantMessage]
-        .filter(Boolean)
-        .join("\n");
-      if (/STOP_REQUEST/.test(previous)) return {};
+      const previousText = lastAssistantMsg?.content ?? "";
+      if (/STOP_REQUEST/.test(previousText)) return {};
 
       const taskFlow = findActiveWorkflow(api, event);
       let state = taskFlow ? readWorkflowState(taskFlow.stateJson) : undefined;
@@ -423,12 +422,14 @@ function findActiveWorkflow(
   api: Record<string, unknown>,
   event: PromptBuildEvent,
 ): FlowLike | undefined {
-  const ctx = event.context as ToolContext | undefined;
-  if (!ctx) return undefined;
-  return (
-    ((api as any).runtime?.tasks?.flow?.fromPromptContext?.(ctx) as FlowLike | undefined) ??
-    ((api as any).runtime?.tasks?.flow?.fromEvent?.(event) as FlowLike | undefined)
-  );
+  try {
+    return (
+      ((api as any).runtime?.tasks?.flow?.fromPromptContext?.(event) as FlowLike | undefined) ??
+      ((api as any).runtime?.tasks?.flow?.fromEvent?.(event) as FlowLike | undefined)
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 function readWorkflowState(value: unknown): WorkflowState | undefined {
