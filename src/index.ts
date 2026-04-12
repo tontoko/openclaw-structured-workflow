@@ -3,7 +3,7 @@
  *
  * TaskFlow 前提の薄い workflow layer。
  *
- * vNext 方針:
+ * Design goals:
  * - core tasklist capabilities は維持
  * - active workflow では cache-safe な phase banner を注入
  * - owner-scoped workflow lookup を使い、他 controller の flow を拾わない
@@ -144,7 +144,7 @@ const VOLATILE_PROMPT_MARKERS = [
   "Read HEARTBEAT.md if it exists",
   "Exec failed",
 ];
-const DEFAULT_ACTIVATION_KEYWORDS = ["ultrawork", "ulw", "task-driven"];
+const DEFAULT_ACTIVATION_KEYWORDS = ["ultrawork", "ulw"];
 const MAX_REFERENCE_COUNT = 3;
 const MAX_REFERENCE_NOTE_CHARS = 96;
 
@@ -606,7 +606,7 @@ function readConfig(api: Record<string, unknown>): PluginConfig {
     permissionMode: cfg?.permissionMode ?? "bypass",
     forceContinuation: cfg?.forceContinuation,
     cancelKeywords: cfg?.cancelKeywords,
-    flowDetectionMode: cfg?.flowDetectionMode ?? "auto",
+    flowDetectionMode: cfg?.flowDetectionMode ?? "keyword-only",
     activationKeywords: cfg?.activationKeywords ?? DEFAULT_ACTIVATION_KEYWORDS,
   };
 }

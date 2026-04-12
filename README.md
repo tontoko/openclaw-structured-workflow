@@ -1,31 +1,44 @@
-# Structured Workflow Plugin for OpenClaw
+# Structured Workflow for OpenClaw
 
-TaskFlow 前提の薄い workflow layer です。core の tasklist capabilities は維持しつつ、active workflow のときだけ短く決定的な phase banner を注入します。
+`structured-workflow` is a TaskFlow-backed OpenClaw plugin that adds a thin,
+owner-scoped workflow layer on top of the built-in tasklist tools.
 
-vNext では次を重視しています。
+It is designed for explicit ultrawork-style sessions where the user opts into a
+workflow by using `ulw` or `ultrawork` in the request. Once a workflow is
+active, the plugin injects a short, deterministic phase banner on meaningful
+turns so the agent can keep its place without adding large, volatile prompt
+blocks.
 
-- core tasklist capabilities の維持
-- cache-safe な active-workflow phase injection
-- owner-scoped workflow lookup
-- reminder / internal runtime context での invalid-state amplification 回避
-- dead だった `forceContinuation` の整理
+## What It Does
 
-## Responsibility
+- Registers `tasklist_create`, `tasklist_update`, `tasklist_status`, and
+  `tasklist_permission`
+- Stores workflow state in TaskFlow, scoped to this plugin's own controller
+- Injects a compact active-workflow banner only when a structured workflow is
+  already active
+- Skips injection on volatile turns such as reminders, internal runtime context,
+  queued-message wrappers, and async command notices
+- Offers workflow bootstrap guidance only for explicit ultrawork triggers
 
-この plugin が持つ責務:
+## What It Does Not Do
 
-- `tasklist_create` / `tasklist_update` / `tasklist_status` / `tasklist_permission`
-- active workflow 中の short phase banner 注入
-- complex instruction に対する workflow bootstrap 提案
-- TaskFlow durable state の owner-scoped な利用
+- Force continuation after every assistant turn
+- Replace OpenClaw compaction or context pruning
+- Provide its own state store outside TaskFlow
+- Orchestrate sub-agents by itself
 
-この plugin が持たない責務:
+## Trigger Model
 
-- forced continuation の実現
-- standalone state store
-- 独自 compaction / context pruning
-- approval policy 本体
-- 他 agent orchestration 本体
+By default, workflow bootstrap is **keyword-only**.
+
+That means the plugin suggests or starts a structured workflow only when the
+incoming prompt explicitly includes one of these activation keywords:
+
+- `ulw`
+- `ultrawork`
+
+Complex-looking requests without those keywords do **not** trigger workflow
+bootstrap by default.
 
 ## Installation
 
@@ -34,7 +47,7 @@ openclaw plugins install ~/openclaw-structured-workflow
 openclaw gateway restart
 ```
 
-### Required OpenClaw Config
+## Required OpenClaw Tool Access
 
 ```json
 {
@@ -51,7 +64,7 @@ openclaw gateway restart
 }
 ```
 
-## Plugin Config
+## Plugin Configuration
 
 ```json
 {
@@ -61,8 +74,8 @@ openclaw gateway restart
         "enabled": true,
         "config": {
           "permissionMode": "bypass",
-          "flowDetectionMode": "auto",
-          "activationKeywords": ["ultrawork", "ulw", "task-driven"]
+          "flowDetectionMode": "keyword-only",
+          "activationKeywords": ["ultrawork", "ulw"]
         }
       }
     }
@@ -70,35 +83,42 @@ openclaw gateway restart
 }
 ```
 
-### Config notes
+### Config Fields
 
-- `permissionMode`: task 実行時の permission mode
-- `flowDetectionMode`: `auto` なら複雑指示検知 + activation keyword、`keyword-only` なら activation keyword のみ
-- `activationKeywords`: workflow bootstrap を強制したいキーワード
-- `forceContinuation`: **deprecated / ignored**。互換性のため受け付けるだけで、vNext では挙動に影響しません
-- `cancelKeywords`: **deprecated / ignored**。旧版設定との互換性のためだけに受け付けます
+- `permissionMode`
+  Permission mode used for task execution state.
+- `flowDetectionMode`
+  `keyword-only` means workflow bootstrap is only triggered by activation
+  keywords. `auto` is still supported for experiments, but is no longer the
+  default.
+- `activationKeywords`
+  Keywords that opt the session into structured workflow bootstrap.
+- `forceContinuation`
+  Deprecated compatibility field. Accepted but ignored.
+- `cancelKeywords`
+  Deprecated compatibility field. Accepted but ignored.
 
 ## Tools
 
 ### `tasklist_create`
 
-複雑な作業を structured task list として開始します。
+Creates a structured task list for the current session.
 
 ```json
 {
   "title": "Implement Feature X",
   "tasks": [
-    { "id": "investigate", "title": "要件調査", "decisionPolicy": "auto" },
-    { "id": "design", "title": "設計", "decisionPolicy": "deliberate" },
-    { "id": "implement", "title": "実装", "decisionPolicy": "auto" },
-    { "id": "verify", "title": "動作確認", "decisionPolicy": "auto" }
+    { "id": "investigate", "title": "Investigate requirements", "decisionPolicy": "auto" },
+    { "id": "design", "title": "Design the approach", "decisionPolicy": "deliberate" },
+    { "id": "implement", "title": "Implement the change", "decisionPolicy": "auto" },
+    { "id": "verify", "title": "Verify behavior", "decisionPolicy": "auto" }
   ]
 }
 ```
 
 ### `tasklist_update`
 
-owner-scoped な active workflow の task 状態を更新します。
+Updates task state for the latest active workflow owned by this plugin.
 
 ```json
 {
@@ -109,7 +129,7 @@ owner-scoped な active workflow の task 状態を更新します。
 }
 ```
 
-valid statuses:
+Valid statuses:
 
 - `running`
 - `completed`
@@ -118,7 +138,9 @@ valid statuses:
 
 ### `tasklist_status`
 
-この session に紐づく最新の structured workflow を表示します。active workflow があればそれを優先し、なければ最新の terminal workflow を返します。
+Returns the latest structured workflow for the current session. If an active
+workflow exists, it is preferred. Otherwise the latest terminal workflow is
+returned.
 
 ```json
 {}
@@ -126,57 +148,44 @@ valid statuses:
 
 ### `tasklist_permission`
 
-permission mode を切り替えます。
+Updates the workflow permission mode.
 
 ```json
 { "mode": "allow-after-first" }
 ```
 
-valid modes:
+Valid modes:
 
 - `bypass`
 - `allow-after-first`
 - `confirm-each`
 
-## Active Workflow Injection
+## Active Workflow Guidance
 
-active workflow があるとき、plugin は `before_prompt_build` で短い phase banner を注入します。
+When a structured workflow is active, the plugin injects a short phase banner in
+`before_prompt_build`.
 
-注入される内容:
+The banner is intentionally small and deterministic. It includes:
 
 - workflow title
-- phase (`plan` / `execute` / `verify` / `fix`)
+- current phase (`plan`, `execute`, `verify`, or `fix`)
 - current task
 - next task
 - blocked summary
-- current task references
-- short rules
+- compact references for the current task
+- short execution rules
 
-重要なのは、**毎 turn でなんでも注入しない**ことです。次の volatile turn では注入をスキップします。
+The plugin does **not** inject that banner on volatile turns, including:
 
-- `System: [...]` で始まる reminder
+- scheduled reminders
 - `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`
 - `[Queued messages while agent was busy]`
-- `Conversation info (untrusted metadata):`
-- async exec completion notice
-- heartbeat / tasklist reminder 系
+- conversation metadata wrappers
+- async exec completion notices
+- heartbeat and tasklist reminder wrappers
 
-この制限により、active workflow guidance を維持しながら prefix churn を抑えます。
-
-## Bootstrap Detection
-
-active workflow が無い場合だけ、complex instruction に対して `tasklist_create` を促します。
-
-- `flowDetectionMode: "auto"`  
-  複雑指示検知と activation keyword のどちらでも発火
-- `flowDetectionMode: "keyword-only"`  
-  activation keyword のみで発火
-
-activation keyword の既定値:
-
-- `ultrawork`
-- `ulw`
-- `task-driven`
+This is deliberate: the plugin keeps workflow guidance available without adding
+avoidable prompt-cache churn.
 
 ## Development
 

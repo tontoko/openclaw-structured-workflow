@@ -1,7 +1,7 @@
 {
   "id": "structured-workflow",
   "name": "Structured Workflow",
-  "description": "Task-list driven workflow plugin built on TaskFlow. Adds owner-scoped tasklist tools, cache-safe active-workflow guidance, and complex-instruction bootstrap prompts.",
+  "description": "Task-list driven workflow plugin built on TaskFlow. Adds owner-scoped tasklist tools, cache-safe active-workflow guidance, and explicit ultrawork bootstrap prompts.",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -25,14 +25,14 @@
       "flowDetectionMode": {
         "type": "string",
         "enum": ["auto", "keyword-only"],
-        "default": "auto",
+        "default": "keyword-only",
         "description": "How to detect when to inject the tasklist bootstrap prompt."
       },
       "activationKeywords": {
         "type": "array",
         "items": { "type": "string" },
-        "default": ["ultrawork", "ulw", "task-driven"],
-        "description": "Keywords that force task decomposition or bootstrap prompting."
+        "default": ["ultrawork", "ulw"],
+        "description": "Keywords that force explicit workflow bootstrap prompting."
       }
     },
     "additionalProperties": false
