@@ -1,39 +1,40 @@
 # Structured Workflow Plugin for OpenClaw
 
-TaskFlow 前提の薄い behavior layer。task 状態に応じて、phase と completion guidance を動的注入します。
+TaskFlow 前提の薄い workflow layer です。core の tasklist capabilities は維持しつつ、active workflow のときだけ短く決定的な phase banner を注入します。
+
+vNext では次を重視しています。
+
+- core tasklist capabilities の維持
+- cache-safe な active-workflow phase injection
+- owner-scoped workflow lookup
+- reminder / internal runtime context での invalid-state amplification 回避
+- dead だった `forceContinuation` の整理
 
 ## Responsibility
 
-この plugin の責務は次だけです。
+この plugin が持つ責務:
 
-- **Structured Task Lists**: tasklist tools で task 状態を扱う
-- **Phase Injection**: `plan -> exec -> verify -> fix` を注入する
-- **Completion Guidance**: current / next / completion condition / evidence を注入する
-- **Idle Detection**: 停滞を検出し、current task へ戻す warning を出す
-- **Reference Integration**: task に紐づく reference を軽量整形して注入する
+- `tasklist_create` / `tasklist_update` / `tasklist_status` / `tasklist_permission`
+- active workflow 中の short phase banner 注入
+- complex instruction に対する workflow bootstrap 提案
+- TaskFlow durable state の owner-scoped な利用
 
-この plugin が**持たない**責務:
+この plugin が持たない責務:
 
-- standalone fallback / 独自 state store
-- 独自永続化
-- audit log
-- IntentGate / safety policy
-- 承認・権限ポリシー本体
+- forced continuation の実現
+- standalone state store
+- 独自 compaction / context pruning
+- approval policy 本体
 - 他 agent orchestration 本体
 
 ## Installation
 
 ```bash
-# From local source
 openclaw plugins install ~/openclaw-structured-workflow
-
-# Restart gateway to load
 openclaw gateway restart
 ```
 
-### Required Configuration
-
-Add plugin tools to `tools.alsoAllow` in your OpenClaw config (`~/.openclaw/openclaw.json`):
+### Required OpenClaw Config
 
 ```json
 {
@@ -50,9 +51,7 @@ Add plugin tools to `tools.alsoAllow` in your OpenClaw config (`~/.openclaw/open
 }
 ```
 
-> **Note**: The `coding` profile does not include plugin-provided tools by default. You must add them to `alsoAllow`.
-
-### Plugin Config (Optional)
+## Plugin Config
 
 ```json
 {
@@ -62,8 +61,8 @@ Add plugin tools to `tools.alsoAllow` in your OpenClaw config (`~/.openclaw/open
         "enabled": true,
         "config": {
           "permissionMode": "bypass",
-          "forceContinuation": true,
-          "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"]
+          "flowDetectionMode": "auto",
+          "activationKeywords": ["ultrawork", "ulw", "task-driven"]
         }
       }
     }
@@ -71,131 +70,120 @@ Add plugin tools to `tools.alsoAllow` in your OpenClaw config (`~/.openclaw/open
 }
 ```
 
+### Config notes
+
+- `permissionMode`: task 実行時の permission mode
+- `flowDetectionMode`: `auto` なら複雑指示検知 + activation keyword、`keyword-only` なら activation keyword のみ
+- `activationKeywords`: workflow bootstrap を強制したいキーワード
+- `forceContinuation`: **deprecated / ignored**。互換性のため受け付けるだけで、vNext では挙動に影響しません
+- `cancelKeywords`: **deprecated / ignored**。旧版設定との互換性のためだけに受け付けます
+
 ## Tools
 
 ### `tasklist_create`
 
-Create a structured task list for a complex instruction.
+複雑な作業を structured task list として開始します。
 
 ```json
 {
   "title": "Implement Feature X",
   "tasks": [
-    { "id": "1", "title": "Design schema", "decisionPolicy": "auto" },
-    { "id": "2", "title": "Implement API", "description": "CRUD endpoints", "decisionPolicy": "auto" },
-    { "id": "3", "title": "Security review", "decisionPolicy": "confirm" },
-    { "id": "4", "title": "Deploy", "decisionPolicy": "notify" }
+    { "id": "investigate", "title": "要件調査", "decisionPolicy": "auto" },
+    { "id": "design", "title": "設計", "decisionPolicy": "deliberate" },
+    { "id": "implement", "title": "実装", "decisionPolicy": "auto" },
+    { "id": "verify", "title": "動作確認", "decisionPolicy": "auto" }
   ]
 }
 ```
 
 ### `tasklist_update`
 
-Update a task's status in the workflow.
+owner-scoped な active workflow の task 状態を更新します。
 
 ```json
 {
-  "taskId": "1",
+  "taskId": "implement",
   "status": "running",
   "assignedAgent": "worker-coder",
   "sessionKey": "agent:worker-coder:subagent:abc123"
 }
 ```
 
-Valid statuses: `running`, `completed`, `skipped`, `blocked`
+valid statuses:
+
+- `running`
+- `completed`
+- `skipped`
+- `blocked`
 
 ### `tasklist_status`
 
-Show current task list status for a workflow.
+この session に紐づく最新の structured workflow を表示します。active workflow があればそれを優先し、なければ最新の terminal workflow を返します。
 
 ```json
-{ "flowId": "standalone-1" }
+{}
 ```
 
 ### `tasklist_permission`
 
-Switch permission mode.
+permission mode を切り替えます。
 
 ```json
 { "mode": "allow-after-first" }
 ```
 
-Valid modes: `bypass`, `allow-after-first`, `confirm-each`
+valid modes:
 
-## Decision Policies
+- `bypass`
+- `allow-after-first`
+- `confirm-each`
 
-| Policy | Behavior |
-|--------|----------|
-| `auto` | Agent proceeds without confirmation |
-| `deliberate` | Agent discusses approach before proceeding |
-| `confirm` | Agent waits for explicit user approval |
-| `notify` | Agent informs user after completion |
+## Active Workflow Injection
 
-## Hook: `before_prompt_build`
+active workflow があるとき、plugin は `before_prompt_build` で短い phase banner を注入します。
 
-この plugin の中核です。workflow が active なとき、動的に次を注入します。
+注入される内容:
 
-### Core sections (毎回)
 - workflow title
-- current phase
-- current task (+ status)
-- next task (+ status)
-- completion condition
-- required evidence
-
-### Conditional sections (必要時のみ)
+- phase (`plan` / `execute` / `verify` / `fix`)
+- current task
+- next task
 - blocked summary
-- idle warning
-- references
+- current task references
 - short rules
 
-テンプレ方針:
-- 通常 40-70 行
-- 最大でも 100 行未満
-- 2k tokens 未満
-- 長文禁止、要約優先
+重要なのは、**毎 turn でなんでも注入しない**ことです。次の volatile turn では注入をスキップします。
 
-### Idle detection
+- `System: [...]` で始まる reminder
+- `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`
+- `[Queued messages while agent was busy]`
+- `Conversation info (untrusted metadata):`
+- async exec completion notice
+- heartbeat / tasklist reminder 系
 
-次の複合条件で停滞を検出します。
-- running task が継続中
-- 直近 3 ターンで `task/current/next/evidence` に未言及
-- 15 分以上経過
+この制限により、active workflow guidance を維持しながら prefix churn を抑えます。
 
-発火時は:
-- warning を注入
-- current task を再提示
-- blocked 候補を提示
+## Bootstrap Detection
 
-### References
+active workflow が無い場合だけ、complex instruction に対して `tasklist_create` を促します。
 
-task ごとに次の形式を持てます。
+- `flowDetectionMode: "auto"`  
+  複雑指示検知と activation keyword のどちらでも発火
+- `flowDetectionMode: "keyword-only"`  
+  activation keyword のみで発火
 
-```json
-{
-  "references": [
-    { "type": "path", "value": "docs/design.md", "note": "設計正本" },
-    { "type": "url", "value": "https://docs.example.com", "note": "外部仕様" }
-  ]
-}
-```
+activation keyword の既定値:
 
-- `type`: `path | url`
-- `note`: 任意、120 文字以内
-- plugin は宣言の正規化と `path/url + short note` 整形まで担当
-- 実際の read/fetch/要約は skill / agent 側の責務
+- `ultrawork`
+- `ulw`
+- `task-driven`
 
 ## Development
 
 ```bash
-# Install dependencies
 npm install
-
-# Lint and format
-npx @biomejs/biome check --write src/index.ts
-
-# Reinstall after changes
-rm -rf ~/.openclaw/extensions/structured-workflow
+npx ultracite fix src/index.ts README.md docs/DESIGN.md openclaw.plugin.json package.json
+npx tsc --noEmit
 openclaw plugins install ~/openclaw-structured-workflow
 openclaw gateway restart
 ```

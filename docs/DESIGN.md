@@ -1,161 +1,142 @@
-# Design: Structured Workflow Plugin v0.4.0
+# Design: Structured Workflow Plugin vNext
+
+## Goals
+
+- preserve core tasklist capabilities
+- add cache-safe active-workflow phase injection
+- scope workflow lookup to this plugin's managed flows
+- avoid invalid-state amplification on reminder / internal-context turns
+- clean up dead `forceContinuation` semantics
 
 ## Responsibility
 
-TaskFlow 前提の薄い behavior layer。
+### Do
 
-### やる
-- tasklist tools (create/update/status/permission)
-- phase 注入 (plan→exec→verify→fix)
-- current/next/completion condition 注入
-- evidence 要求
-- idle 検知 (停滞検出 + hook 発火まで)
-- reference 統合 (宣言正規化 + path/url + short note 整形)
+- create/update/show structured task lists
+- inject a short active-workflow banner on meaningful turns
+- suggest workflow bootstrap for complex requests
+- keep workflow state inside TaskFlow managed flows
 
-### やらない
-- standalone fallback / 独自 state store
-- 独自永続化
-- audit log
-- IntentGate / safety policy
-- 承認・権限ポリシー本体
-- 他 agent orchestration 本体
+### Do Not
 
-## 3-Layer Separation
+- implement forced continuation
+- own approval policy
+- own standalone persistence
+- own compaction or prompt pruning
+- rewrite unrelated TaskFlow controllers
 
-```
-┌─────────────────────────────────────┐
-│  OpenClaw                           │
-│  実行基盤: session/tool/runtime/権限  │
-│  /安全/配信/監査                     │
-├─────────────────────────────────────┤
-│  TaskFlow                           │
-│  durable state machine: flow ID,    │
-│  revision, wait/resume, child-link, │
-│  state 永続                         │
-├─────────────────────────────────────┤
-│  structured-workflow plugin         │
-│  薄い behavior layer: phase 注入,   │
-│  current/next/completion, evidence, │
-│  idle hook, reference 統合           │
-└─────────────────────────────────────┘
+## State Ownership
+
+Managed flows created by this plugin always use:
+
+```text
+controllerId = "structured-workflow/tasklist"
 ```
 
-### 境界破壊の例 (やってはいけないこと)
-- OpenClaw が phase 分岐を持つ
-- TaskFlow が承認判定ポリシーを持つ
-- plugin が DB 永続化や独自 state store を持つ
+Lookup rules:
 
-## Tools
+1. enumerate `taskFlow.list()`
+2. keep only flows with this controller id
+3. prefer active statuses: `queued`, `running`, `waiting`, `blocked`
+4. otherwise fall back to the latest terminal flow for `tasklist_status`
 
-4 tools (変更なし):
-- `tasklist_create`: task list 作成
-- `tasklist_update`: status 更新
-- `tasklist_status`: 現在状態表示
-- `tasklist_permission`: permission mode 切替
+This replaces blind `findLatest()`, which can pick another controller's flow and cause false `invalid state` errors.
 
-## Hook: before_prompt_build
+## Active Workflow Injection
 
-### 注入テンプレ構造
+### Why
 
-```
-🔴 WORKFLOW ACTIVE — [title]
-Phase: [current_phase]
+The original docs implied always-on phase injection. The idea is valid, but naive per-turn injection is hostile to provider-side prompt caching. vNext keeps the guidance while making the injected block short and deterministic.
 
-▸ Current: [id]. [title] ([status])
-  [description (1-2行)]
-▸ Next: [id]. [title] ([status])
+### Injection contract
 
-Completion:
-  - [condition_1]
-  - [condition_2]
+The plugin injects a banner only when:
 
-Evidence required:
-  - [evidence_description]
+- an active structured workflow exists
+- the incoming turn is not a volatile system/runtime wrapper
 
-[IF blocked tasks exist]
-🚫 Blocked:
-  - [id]. [title]: [blockedReason]
-[END]
+Injected fields:
 
-[IF idle detected]
-⚠️ IDLE: No progress on task/evidence in 3 turns / 15 min.
-  → Resume current task or resolve blockers.
-[END]
-
-[IF references exist]
-📎 References:
-  - [path|url] [value] — [note (≤120 chars)]
-[END]
-
+```text
+🔴 WORKFLOW ACTIVE
+Title: ...
+Phase: plan|execute|verify|fix
+Current: ...
+Next: ...
+Blocked: ...
+References:
+- ...
 Rules:
-- Complete all tasks before declaring workflow done.
-- Provide evidence for completed tasks.
-- If blocked, explain why and what's needed.
+- ...
 ```
 
-### Idle Detection
+### Volatile turn suppression
 
-複合条件 (全て満たしたら発火):
-1. running task が存在
-2. 直近 3 ターンの assistant 応答に `task/current/next/evidence` のいずれも未言及
-3. 15 分以上経過
+No injection on turns that begin with or contain wrappers such as:
 
-発火時の挙動:
-- warning 注入
-- current task 再提示
-- blocked 候補提示
-- verify 送りはしない
+- `System: [...]`
+- `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`
+- `[Queued messages while agent was busy]`
+- `Conversation info (untrusted metadata):`
+- async exec completion notices
+- heartbeat / tasklist reminder prompts
 
-### References
+This avoids adding one more volatile prefix block on turns that already tend to break cache reuse.
 
-task ごとに optional:
-```ts
-references?: Array<{
-  type: "path" | "url";
-  value: string;
-  note?: string; // max 120 chars
-}>
-```
+## Phase Heuristic
 
-- plugin は宣言の正規化 + `path/url — short note` 整形まで
-- 実際の read/fetch/要約は skill/agent 側の責務
+The banner phase is derived from task state:
 
-## Storage
+- `fix`: any blocked task exists
+- `plan`: nothing has started yet
+- `verify`: all remaining work looks verification-oriented
+- `execute`: otherwise
 
-TaskFlow runtime のみ使用。standalone fallback は v0.4.0 で削除。
+`verify` is heuristic, based on task id/title/description keywords such as `verify`, `test`, `review`, `確認`, `検証`, `動作確認`.
 
-## Configuration
+## Bootstrap Detection
 
-```json
-{
-  "permissionMode": "bypass" | "allow-after-first" | "confirm-each",
-  "forceContinuation": true,
-  "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"]
-}
-```
+If no active workflow exists, the plugin can inject a bootstrap prompt that requires `tasklist_create`.
 
-## 他プラグインからの採用
+Modes:
 
-### 採用
-- ClaudeCode 系の phase 構造 (plan→exec→verify→fix)
-- Claude Code 公式の hook/event 駆動
-- AWS Amplify 系の reference 統合
-- Todo Enforcer 系の idle 検知
+- `auto`: complex-instruction heuristic OR activation keyword
+- `keyword-only`: activation keyword only
 
-### 条件付き採用
-- deep-interview→plan: 常時ではなく曖昧/高リスク時のみ
+Default activation keywords:
 
-### 不採用
-- ULW 200+行の巨大注入
-- Ralph Loop
-- IntentGate
-- audit log
-- 独自 persistent memory / 自律改善
+- `ultrawork`
+- `ulw`
+- `task-driven`
 
-## Key Learnings (v0.1.0〜v0.3.0)
+## Deprecated Config
 
-1. **TaskFlow fromToolContext throws**: `ctx.sessionKey` が必要。try-catch 必須。
-2. **Plugin tools need alsoAllow**: `tools.profile: "coding"` は plugin tools を含まない。
-3. **@sinclair/typebox**: dependencies に必須 (runtime path resolution の問題)。
-4. **責務が広がりやすい**: plugin に state store / audit / safety を混ぜると境界破壊。
-5. **standalone fallback は負債**: TaskFlow 前提に割り切る方が健全。
+`forceContinuation` and `cancelKeywords` remain accepted for compatibility, but are intentionally ignored.
+
+Reason:
+
+- `before_prompt_build` runs before the next response, not after the agent decides to stop
+- true forced continuation would need a different lifecycle hook or stop gate
+
+Keeping the field but marking it deprecated avoids breaking existing local config while removing false promises from behavior.
+
+## Output Design
+
+### `tasklist_status`
+
+- never calls another controller's flow
+- never emits `invalid state` as a user-facing error for unrelated flows
+- returns the latest structured workflow if available
+
+### `tasklist_update`
+
+- updates only the latest active structured workflow
+- if none exists, returns a calm informational message instead of error amplification
+
+## Non-goals for vNext
+
+- idle detection
+- reminder-aware task automation
+- workflow-specific approval gates
+- persistent audit logging
+- active workflow summarization beyond the short banner
