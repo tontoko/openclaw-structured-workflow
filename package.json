@@ -1,6 +1,6 @@
 {
   "name": "@tontoko/openclaw-structured-workflow",
-  "version": "0.4.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Task-list driven workflow plugin for OpenClaw. Structured decomposition, decision policies, permission modes, and forced continuation on TaskFlow.",
   "license": "MIT",

@@ -1,14 +1,22 @@
 /**
- * Structured Workflow Plugin for OpenClaw v0.4.0
+ * Structured Workflow Plugin for OpenClaw v0.7.0
  *
- * TaskFlow前提の薄い behavior layer。
- * task 状態に応じて phase と completion guidance を動的注入。
+ * TaskFlow前提の behavior layer。進行制御を担う。
+ * v0.7.0: 強制継続（命令注入）, 停止許可状態機械, 複雑指示検知ヒューリスティック
  *
- * 責務: phase注入, current/next/completion, evidence要求, idle検知, reference統合
- * 責務外: standalone fallback, 独自永続化, audit log, IntentGate, 承認/権限, orchestration
+ * Runtime契約:
+ * - ツールは tool factory context (ctx.sessionKey) があれば登録、なければスキップ
+ * - Hook (before_prompt_build) は hookCtx.sessionKey + bindSession で TaskFlow 取得
+ * - TaskFlow取得: fromToolContext (tool factory) / bindSession (hooks)
+ * - 参考実装: lobster (factory pattern + ctx.sessionKey guard), webhooks (bindSession), inbox-triage
+ *
+ * Behavior層の責務:
+ * - いつ tasklist を作るか（複雑指示検知）
+ * - いつ「まだ止まるな」を発火するか（強制継続）
+ * - 停止許可条件をどう判定するか（状態機械）
+ * - 進行状態の注入（現在タスク・次タスク・完了条件）
  */
 
-// @ts-expect-error typebox is provided by the host at build/runtime.
 import { Type } from "@sinclair/typebox";
 // @ts-expect-error openclaw plugin SDK is provided by the host at build/runtime.
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
@@ -56,30 +64,72 @@ interface PluginConfig {
   cancelKeywords?: string[];
 }
 
-interface FlowLike {
-  flowId?: string;
-  revision?: number;
-  stateJson?: unknown;
-  createManaged?: (
-    input: Record<string, unknown>,
-  ) => { flowId?: string; revision?: number } | Promise<{ flowId?: string; revision?: number }>;
-  updateManaged?: (input: {
-    revision?: number;
-    stateJson?: unknown;
-  }) => { revision?: number } | Promise<{ revision?: number }>;
-  runTask?: (input: Record<string, unknown>) => unknown;
+interface BoundTaskFlow {
+  readonly sessionKey: string;
+  readonly flowId?: string;
+  readonly revision?: number;
+  readonly stateJson?: unknown;
+  createManaged: (input: Record<string, unknown>) => { flowId: string; revision: number };
+  get: (flowId: string) => unknown | undefined;
+  list: () => unknown[];
+  findLatest: () => unknown | undefined;
+  setWaiting: (input: Record<string, unknown>) => { applied: boolean; flow: any; code?: string };
+  resume: (input: Record<string, unknown>) => { applied: boolean; flow: any; code?: string };
+  finish: (input: Record<string, unknown>) => { applied: boolean; flow: any; code?: string };
+  fail: (input: Record<string, unknown>) => { applied: boolean; flow: any; code?: string };
+  requestCancel: (input: Record<string, unknown>) => { applied: boolean; flow: any; code?: string };
+  runTask: (input: Record<string, unknown>) => { created: boolean; reason?: string; flow?: any; task?: any };
+  updateManaged?: (input: Record<string, unknown>) => { applied: boolean; flow: any; code?: string };
 }
 
-type ToolContext = Record<string, unknown>;
+interface TaskFlowApi {
+  fromToolContext: (ctx: { sessionKey: string; deliveryContext?: unknown }) => BoundTaskFlow;
+  bindSession: (params: { sessionKey: string; requesterOrigin?: unknown }) => BoundTaskFlow;
+}
+
+type ToolContext = {
+  sessionKey?: string;
+  deliveryContext?: unknown;
+  sandboxed?: boolean;
+  [key: string]: unknown;
+};
+
 type PromptBuildEvent = {
   prompt?: string;
   messages?: Array<{ role: string; content?: string }>;
-} & Record<string, unknown>;
+};
+
+type HookAgentContext = {
+  sessionKey?: string;
+  agentId?: string;
+  sessionId?: string;
+  [key: string]: unknown;
+};
 
 // --- Constants ---
 
 const PLUGIN_ID = "structured-workflow";
-const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop"];
+const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop", "/abort", "/force-finish"];
+
+// 複雑指示検知キーワード
+const COMPLEXITY_KEYWORDS = [
+  "実装", "実装して", "修正", "修正して", "調査", "調べて", "設計", "デザイン",
+  "テスト", "検証", "確認", "レビュー", "リファクタ", "リファクタリング",
+  "implement", "fix", "investigate", "design", "refactor", "review",
+  "build", "create", "develop", "deploy",
+  "やって", "してください", "お願い", "全て", "すべて",
+  "してから", "した後に", "終わったら", "終わらせて",
+];
+
+// Task skeleton templates
+const DEFAULT_TASK_SKELETON = [
+  { id: "investigate", title: "要件調査", decisionPolicy: "auto" as DecisionPolicy },
+  { id: "design", title: "設計", decisionPolicy: "deliberate" as DecisionPolicy },
+  { id: "test-first", title: "テスト観点整理", decisionPolicy: "auto" as DecisionPolicy },
+  { id: "implement", title: "実装", decisionPolicy: "auto" as DecisionPolicy },
+  { id: "test", title: "テスト", decisionPolicy: "auto" as DecisionPolicy },
+  { id: "verify", title: "動作確認", decisionPolicy: "auto" as DecisionPolicy },
+];
 
 // --- Plugin ---
 
@@ -87,279 +137,416 @@ export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Structured Workflow",
   description:
-    "TaskFlow前提の薄い behavior layer。phase注入, completion guidance, idle検知, reference統合。",
+    "TaskFlow-based task orchestration with forced continuation, stop gate, complexity detection, and phase injection.",
 
   register(api: any) {
-    // --- tasklist_create ---
-    api.registerTool({
-      name: "tasklist_create",
-      description: "Create a structured task list for a complex instruction.",
-      parameters: Type.Object({
-        title: Type.String(),
-        tasks: Type.Array(
-          Type.Object({
-            id: Type.String(),
-            title: Type.String(),
-            description: Type.Optional(Type.String()),
-            decisionPolicy: Type.Optional(
-              Type.Union([
-                Type.Literal("auto"),
-                Type.Literal("deliberate"),
-                Type.Literal("confirm"),
-                Type.Literal("notify"),
-              ]),
-            ),
-            deliberateWith: Type.Optional(Type.Array(Type.String())),
-            references: Type.Optional(
-              Type.Array(
-                Type.Object({
-                  type: Type.Union([Type.Literal("path"), Type.Literal("url")]),
-                  value: Type.String(),
-                  note: Type.Optional(Type.String()),
-                }),
+    const logger = api.logger ?? { info: () => {}, warn: () => {}, error: () => {} };
+
+    const flowApi = resolveFlowApi(api);
+
+    // --- Tool factory pattern (lobster-style) ---
+    api.registerTool(((ctx: ToolContext) => {
+      if (!ctx?.sessionKey) {
+        logger.warn?.(`[${PLUGIN_ID}] Tool factory: no sessionKey. Tools not registered.`);
+        return null;
+      }
+
+      const taskFlow = flowApi
+        ? flowApi.fromToolContext({ sessionKey: ctx.sessionKey, deliveryContext: ctx.deliveryContext })
+        : undefined;
+
+      if (!taskFlow) {
+        logger.warn?.(`[${PLUGIN_ID}] TaskFlow unavailable for session ${ctx.sessionKey}.`);
+        return null;
+      }
+
+      // --- tasklist_create ---
+      const tasklistCreate = {
+        name: "tasklist_create",
+        description: "Create a structured task list for a complex instruction.",
+        parameters: Type.Object({
+          title: Type.String(),
+          tasks: Type.Array(
+            Type.Object({
+              id: Type.String(),
+              title: Type.String(),
+              description: Type.Optional(Type.String()),
+              decisionPolicy: Type.Optional(
+                Type.Union([
+                  Type.Literal("auto"),
+                  Type.Literal("deliberate"),
+                  Type.Literal("confirm"),
+                  Type.Literal("notify"),
+                ]),
               ),
-            ),
-          }),
-        ),
-      }),
-      async execute(_id: string, params: any, ctx: ToolContext) {
-        const now = new Date().toISOString();
-        const tasks: TaskItem[] = params.tasks.map((t: any) => ({
-          id: String(t.id),
-          title: String(t.title),
-          description: t.description,
-          status: "pending" as TaskStatus,
-          decisionPolicy: (t.decisionPolicy ?? "auto") as DecisionPolicy,
-          deliberateWith: t.deliberateWith ?? [],
-          references: t.references ?? [],
-          assignedAgent: null,
-          sessionKey: null,
-          completedAt: null,
-          evidence: null,
-          blockedReason: null,
-        }));
+              deliberateWith: Type.Optional(Type.Array(Type.String())),
+              references: Type.Optional(
+                Type.Array(
+                  Type.Object({
+                    type: Type.Union([Type.Literal("path"), Type.Literal("url")]),
+                    value: Type.String(),
+                    note: Type.Optional(Type.String()),
+                  }),
+                ),
+              ),
+            }),
+          ),
+        }),
+        async execute(_id: string, params: any, _ctx: ToolContext) {
+          const now = new Date().toISOString();
+          const tasks: TaskItem[] = params.tasks.map((t: any) => ({
+            id: String(t.id),
+            title: String(t.title),
+            description: t.description,
+            status: "pending" as TaskStatus,
+            decisionPolicy: (t.decisionPolicy ?? "auto") as DecisionPolicy,
+            deliberateWith: t.deliberateWith ?? [],
+            references: t.references ?? [],
+            assignedAgent: null,
+            sessionKey: null,
+            completedAt: null,
+            evidence: null,
+            blockedReason: null,
+          }));
 
-        const state: WorkflowState = {
-          type: "workflow",
-          title: params.title,
-          tasks,
-          permissionMode: readConfig(api).permissionMode ?? "bypass",
-          createdAt: now,
-          updatedAt: now,
-        };
+          const state: WorkflowState = {
+            type: "workflow",
+            title: params.title,
+            tasks,
+            permissionMode: readConfig(api).permissionMode ?? "bypass",
+            createdAt: now,
+            updatedAt: now,
+          };
 
-        const taskFlow = getTaskFlow(api, ctx);
-        if (!taskFlow) {
-          return toolError("TaskFlow runtime required. This plugin requires TaskFlow.");
-        }
-
-        const created = await maybeAwait(
-          taskFlow.createManaged?.({
+          const created = taskFlow.createManaged({
             controllerId: `${PLUGIN_ID}/tasklist`,
             goal: params.title,
             currentStep: "create task list",
             stateJson: state,
-          }),
-        );
-        const flowId = created?.flowId ?? taskFlow.flowId ?? "unknown";
-        const revision = created?.revision ?? taskFlow.revision;
+          });
 
-        return textResult(
-          [
-            `📋 Task list created`,
-            `Flow: ${flowId}${revision !== undefined ? ` (rev ${revision})` : ""}`,
-            "",
-            formatTaskList(state),
-          ].join("\n"),
-        );
-      },
-    });
-
-    // --- tasklist_update ---
-    api.registerTool({
-      name: "tasklist_update",
-      description: "Update a task's status in the workflow.",
-      parameters: Type.Object({
-        flowId: Type.Optional(Type.String()),
-        taskId: Type.String(),
-        status: Type.Union([
-          Type.Literal("running"),
-          Type.Literal("completed"),
-          Type.Literal("skipped"),
-          Type.Literal("blocked"),
-        ]),
-        expectedRevision: Type.Optional(Type.Number()),
-        evidence: Type.Optional(Type.String()),
-        assignedAgent: Type.Optional(Type.String()),
-        sessionKey: Type.Optional(Type.String()),
-        blockedReason: Type.Optional(Type.String()),
-      }),
-      async execute(_id: string, params: any, ctx: ToolContext) {
-        const taskFlow = getTaskFlow(api, ctx);
-        if (!taskFlow) {
-          return toolError("TaskFlow runtime required.");
-        }
-
-        const current = readWorkflowState(taskFlow.stateJson);
-        if (!current) return toolError("No active workflow state found.");
-
-        if (
-          params.expectedRevision !== undefined &&
-          taskFlow.revision !== undefined &&
-          params.expectedRevision !== taskFlow.revision
-        ) {
-          return toolError(
-            `Revision conflict: expected ${params.expectedRevision}, current ${taskFlow.revision}.`,
+          return textResult(
+            [
+              `📋 Task list created`,
+              `Flow: ${created.flowId} (rev ${created.revision})`,
+              "",
+              formatTaskList(state, created.flowId, created.revision),
+            ].join("\n"),
           );
-        }
+        },
+      };
 
-        const next = cloneState(current);
-        const target = findTask(next.tasks, params.taskId);
-        if (!target) return toolError(`Task not found: ${params.taskId}`);
+      // --- tasklist_update ---
+      const tasklistUpdate = {
+        name: "tasklist_update",
+        description: "Update a task's status in the workflow.",
+        parameters: Type.Object({
+          taskId: Type.String(),
+          status: Type.Union([
+            Type.Literal("running"),
+            Type.Literal("completed"),
+            Type.Literal("skipped"),
+            Type.Literal("blocked"),
+          ]),
+          expectedRevision: Type.Optional(Type.Number()),
+          evidence: Type.Optional(Type.String()),
+          assignedAgent: Type.Optional(Type.String()),
+          sessionKey: Type.Optional(Type.String()),
+          blockedReason: Type.Optional(Type.String()),
+        }),
+        async execute(_id: string, params: any, _ctx: ToolContext) {
+          const latest = taskFlow.findLatest();
+          const current = readWorkflowState((latest as any)?.stateJson);
+          if (!current) return toolError("No active workflow found in this session.");
 
-        // Warnings
-        const warnings: string[] = [];
-        if (params.status === "completed" && !params.evidence && !target.evidence) {
-          warnings.push("⚠️ No evidence provided for completed task.");
-        }
-        if (params.status === "blocked" && !params.blockedReason) {
-          warnings.push("⚠️ Task blocked without reason.");
-        }
+          if (
+            params.expectedRevision !== undefined &&
+            (latest as any)?.revision !== undefined &&
+            params.expectedRevision !== (latest as any).revision
+          ) {
+            return toolError(
+              `Revision conflict: expected ${params.expectedRevision}, current ${(latest as any).revision}.`,
+            );
+          }
 
-        target.status = params.status;
-        if (params.assignedAgent !== undefined) target.assignedAgent = params.assignedAgent;
-        if (params.sessionKey !== undefined) target.sessionKey = params.sessionKey;
-        if (params.evidence !== undefined) target.evidence = params.evidence;
-        if (params.blockedReason !== undefined) target.blockedReason = params.blockedReason;
-        if (["completed", "skipped", "blocked"].includes(params.status)) {
-          target.completedAt = new Date().toISOString();
-        }
-        next.updatedAt = new Date().toISOString();
+          const next = cloneState(current);
+          const target = findTask(next.tasks, params.taskId);
+          if (!target) return toolError(`Task not found: ${params.taskId}`);
 
-        const updated = await maybeAwait(
-          taskFlow.updateManaged?.({ revision: taskFlow.revision, stateJson: next }),
-        );
-        const nextRevision = updated?.revision ?? (taskFlow.revision ?? 0) + 1;
+          const warnings: string[] = [];
+          if (params.status === "completed" && !params.evidence && !target.evidence) {
+            warnings.push("⚠️ No evidence provided for completed task.");
+          }
+          if (params.status === "blocked" && !params.blockedReason) {
+            warnings.push("⚠️ Task blocked without reason.");
+          }
 
-        if (params.status === "running" && params.sessionKey) {
-          await maybeAwait(
-            taskFlow.runTask?.({
-              taskId: params.taskId,
-              sessionKey: params.sessionKey,
-              assignedAgent: params.assignedAgent,
-              flowId: params.flowId ?? taskFlow.flowId,
-            }),
+          target.status = params.status;
+          if (params.assignedAgent !== undefined) target.assignedAgent = params.assignedAgent;
+          if (params.sessionKey !== undefined) target.sessionKey = params.sessionKey;
+          if (params.evidence !== undefined) target.evidence = params.evidence;
+          if (params.blockedReason !== undefined) target.blockedReason = params.blockedReason;
+          if (["completed", "skipped", "blocked"].includes(params.status)) {
+            target.completedAt = new Date().toISOString();
+          }
+          next.updatedAt = new Date().toISOString();
+
+          const flowId = (latest as any)?.flowId;
+          const revision = (latest as any)?.revision ?? 0;
+
+          const allDone = next.tasks.every(
+            (t) => t.status === "completed" || t.status === "skipped",
           );
-        }
 
-        return textResult(
-          [
-            `✅ Task ${params.taskId} → ${params.status}`,
-            params.evidence ? `Evidence: ${params.evidence}` : null,
-            params.blockedReason ? `Blocked: ${params.blockedReason}` : null,
-            `Revision: ${nextRevision}`,
-            ...warnings,
-          ]
-            .filter(Boolean)
-            .join("\n"),
-        );
-      },
-    });
+          if (allDone) {
+            const finished = taskFlow.finish({
+              flowId,
+              expectedRevision: revision,
+              stateJson: next,
+            });
+            if (!finished.applied) {
+              return toolError(`Failed to finish workflow: ${finished.code ?? "unknown"}`);
+            }
+            return textResult(
+              [
+                `🏁 Workflow complete: ${next.title}`,
+                `All ${next.tasks.length} tasks done.`,
+                "",
+                formatTaskList(next, flowId, (finished.flow as any)?.revision),
+              ].join("\n"),
+            );
+          }
 
-    // --- tasklist_status ---
-    api.registerTool({
-      name: "tasklist_status",
-      description: "Show current task list status for a workflow.",
-      parameters: Type.Object({ flowId: Type.Optional(Type.String()) }),
-      async execute(_id: string, _params: any, ctx: ToolContext) {
-        const taskFlow = getTaskFlow(api, ctx);
-        if (!taskFlow) return toolError("TaskFlow runtime required.");
+          const updated = taskFlow.resume({
+            flowId,
+            expectedRevision: revision,
+            status: "running",
+            currentStep: params.taskId,
+            stateJson: next,
+          });
 
-        const state = readWorkflowState(taskFlow.stateJson);
-        if (!state) return toolError("No active workflow state found.");
+          if (!updated.applied) {
+            return toolError(`Failed to update workflow: ${updated.code ?? "unknown"}`);
+          }
 
-        return textResult(formatTaskList(state, taskFlow.flowId, taskFlow.revision));
-      },
-    });
+          const nextRevision = (updated.flow as any)?.revision ?? revision + 1;
 
-    // --- tasklist_permission ---
-    api.registerTool({
-      name: "tasklist_permission",
-      description: "Switch permission mode.",
-      parameters: Type.Object({
-        mode: Type.Union([
-          Type.Literal("bypass"),
-          Type.Literal("allow-after-first"),
-          Type.Literal("confirm-each"),
-        ]),
-        reason: Type.Optional(Type.String()),
-      }),
-      async execute(_id: string, params: any) {
-        if (typeof api.updateConfig === "function") {
-          await maybeAwait(api.updateConfig({ permissionMode: params.mode }));
-        }
-        return textResult(
-          `🔐 Permission mode → ${params.mode}${params.reason ? ` (${params.reason})` : ""}`,
-        );
-      },
-    });
+          if (params.status === "running" && params.sessionKey) {
+            taskFlow.runTask({
+              flowId,
+              runtime: "acp",
+              childSessionKey: params.sessionKey,
+              task: `Execute task: ${params.taskId} - ${target.title}`,
+              status: "running",
+              startedAt: Date.now(),
+              lastEventAt: Date.now(),
+            });
+          }
+
+          return textResult(
+            [
+              `✅ Task ${params.taskId} → ${params.status}`,
+              params.evidence ? `Evidence: ${params.evidence}` : null,
+              params.blockedReason ? `Blocked: ${params.blockedReason}` : null,
+              `Revision: ${nextRevision}`,
+              ...warnings,
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          );
+        },
+      };
+
+      // --- tasklist_status ---
+      const tasklistStatus = {
+        name: "tasklist_status",
+        description: "Show current task list status for a workflow.",
+        parameters: Type.Object({}),
+        async execute(_id: string, _params: any, _ctx: ToolContext) {
+          const latest = taskFlow.findLatest();
+          if (!latest) return textResult("No active workflow in this session.");
+
+          const state = readWorkflowState((latest as any)?.stateJson);
+          if (!state) return toolError("Active workflow has invalid state.");
+
+          return textResult(formatTaskList(state, (latest as any).flowId, (latest as any).revision));
+        },
+      };
+
+      // --- tasklist_permission ---
+      const tasklistPermission = {
+        name: "tasklist_permission",
+        description: "Switch permission mode.",
+        parameters: Type.Object({
+          mode: Type.Union([
+            Type.Literal("bypass"),
+            Type.Literal("allow-after-first"),
+            Type.Literal("confirm-each"),
+          ]),
+          reason: Type.Optional(Type.String()),
+        }),
+        async execute(_id: string, params: any, _ctx: ToolContext) {
+          if (typeof api.updateConfig === "function") {
+            await maybeAwait(api.updateConfig({ permissionMode: params.mode }));
+          }
+          return textResult(
+            `🔐 Permission mode → ${params.mode}${params.reason ? ` (${params.reason})` : ""}`,
+          );
+        },
+      };
+
+      return [tasklistCreate, tasklistUpdate, tasklistStatus, tasklistPermission];
+    }), { optional: true });
 
     // --- Hook: before_prompt_build ---
-    api.on("before_prompt_build", async (event: PromptBuildEvent) => {
-      const config = readConfig(api);
-      if (config.forceContinuation === false) return {};
+    // Behavior layer: forced continuation, stop gate, complexity detection, phase injection
+    api.on(
+      "before_prompt_build",
+      async (event: PromptBuildEvent, hookCtx: HookAgentContext) => {
+        const config = readConfig(api);
+        const sessionKey = hookCtx?.sessionKey;
+        if (!sessionKey) return {};
 
-      const incomingText = event.prompt ?? "";
-      const messages = event.messages ?? [];
-      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-      const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
-      const fullText = [incomingText, lastUserMsg?.content].filter(Boolean).join("\n");
+        const incomingText = event.prompt ?? "";
+        const messages = event.messages ?? [];
+        const lastUserMsg = [...messages].reverse().find((m: any) => m.role === "user");
+        const lastAssistantMsg = [...messages].reverse().find((m: any) => m.role === "assistant");
+        const fullText = [incomingText, lastUserMsg?.content].filter(Boolean).join("\n");
 
-      if (containsKeyword(fullText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS)) return {};
-      if (/STOP_REQUEST/.test(lastAssistantMsg?.content ?? "")) return {};
+        // --- Stop gate: cancel keywords allow immediate stop ---
+        if (containsKeyword(fullText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS)) {
+          return {};
+        }
 
-      const taskFlow = findActiveWorkflow(api, event);
-      if (!taskFlow) return {};
+        // --- Stop gate: STOP_REQUEST in prior assistant message ---
+        if (/STOP_REQUEST/.test(lastAssistantMsg?.content ?? "")) return {};
 
-      const state = readWorkflowState(taskFlow.stateJson);
-      if (!state) return {};
+        if (!flowApi) return {};
 
-      const incomplete = state.tasks.filter(
-        (t) => t.status === "pending" || t.status === "running",
-      );
-      const blocked = state.tasks.filter((t) => t.status === "blocked");
+        const boundFlow = flowApi.bindSession({ sessionKey });
+        const latest = boundFlow.findLatest();
+        const hasActiveFlow = !!latest;
+        const state = hasActiveFlow ? readWorkflowState((latest as any)?.stateJson) : undefined;
 
-      if (incomplete.length === 0 && blocked.length === 0) return {};
+        // --- Complexity detection: suggest tasklist_create for complex instructions ---
+        // Only when no active workflow exists
+        if (!hasActiveFlow && isComplexInstruction(fullText)) {
+          const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
+          return {
+            prependSystemContext: [
+              "🔴 STRUCTURED WORKFLOW — Complex instruction detected.",
+              "",
+              "You MUST use tasklist_create to decompose this task before proceeding.",
+              "Use this task skeleton as a starting point, adjusting to the specific request:",
+              skeleton,
+              "",
+              "Rules:",
+              "- Use tasklist_create BEFORE starting any work.",
+              "- Set decisionPolicy: 'deliberate' for design/architecture decisions.",
+              "- Provide evidence for every completed task.",
+              "- Do NOT declare the workflow done until all tasks are completed or blocked.",
+            ].join("\n"),
+          };
+        }
 
-      // Idle detection
-      const idleWarning = detectIdle(incomplete, lastAssistantMsg?.content ?? "");
+        // --- If no active workflow and not complex, do nothing ---
+        if (!state) return {};
 
-      return {
-        prependSystemContext: buildInjectionContext(state, incomplete, blocked, idleWarning),
-      };
-    });
+        const incomplete = state.tasks.filter(
+          (t) => t.status === "pending" || t.status === "running",
+        );
+        const blocked = state.tasks.filter((t) => t.status === "blocked");
+
+        // --- Stop gate: all tasks terminal = stop allowed ---
+        if (incomplete.length === 0 && blocked.length === 0) {
+          // All terminal — no injection needed
+          return {};
+        }
+
+        // --- Forced continuation: incomplete tasks remain ---
+        const idleWarning = detectIdle(incomplete, lastAssistantMsg?.content ?? "");
+
+        return {
+          prependSystemContext: buildForcedContinuationContext(state, incomplete, blocked, idleWarning),
+        };
+      },
+    );
   },
 });
 
+// --- TaskFlow Resolution ---
+
+function resolveFlowApi(api: any): TaskFlowApi | undefined {
+  return api?.runtime?.taskFlow ?? api?.runtime?.tasks?.flow;
+}
+
+// --- Complexity Detection ---
+
+function isComplexInstruction(text: string): boolean {
+  if (!text || text.length < 30) return false;
+
+  let score = 0;
+
+  // Multi-sentence requests
+  const sentences = text.split(/[。.!?！？\n]/).filter((s) => s.trim().length > 5);
+  if (sentences.length >= 3) score += 2;
+
+  // Keyword matching
+  const keywordHits = COMPLEXITY_KEYWORDS.filter((kw) => text.toLowerCase().includes(kw.toLowerCase()));
+  score += Math.min(keywordHits.length, 3);
+
+  // Multi-step indicators
+  if (/してから|した後に|終わったら|終わらせて|then|after|before|まで/i.test(text)) score += 2;
+  if (/全て|すべて|全部|all|every|entire/i.test(text)) score += 1;
+
+  // Task-like structure
+  if (/番目|第[0-9]|ステップ|step|phase|段階/i.test(text)) score += 2;
+
+  return score >= 3;
+}
+
+// --- Stop Gate State Machine ---
+
+/**
+ * Stop allowed conditions:
+ * 1. All tasks completed/skipped (no incomplete, no blocked)
+ * 2. Cancel keyword detected (handled before this function)
+ * 3. All tasks either completed/skipped OR blocked with explicit handoff
+ *
+ * Stop DENIED when:
+ * - Any task is pending or running
+ * - Unless blocked + explicit user-facing handoff
+ */
+function isStopAllowed(state: WorkflowState): boolean {
+  const incomplete = state.tasks.filter(
+    (t) => t.status === "pending" || t.status === "running",
+  );
+  if (incomplete.length === 0) return true;
+
+  // All remaining are blocked = stop allowed (user handoff)
+  const allBlocked = state.tasks.every(
+    (t) => t.status === "completed" || t.status === "skipped" || t.status === "blocked",
+  );
+  return allBlocked;
+}
+
 // --- Idle Detection ---
 
-const IDLE_TURN_THRESHOLD = 3;
 const TASK_CONTEXT_PATTERN = /\b(task|current|next|evidence|complete|blocked)\b/i;
 
 function detectIdle(incomplete: TaskItem[], lastAssistantContent: string): string | null {
   const running = incomplete.find((t) => t.status === "running");
   if (!running) return null;
 
-  // Simple check: if last assistant response didn't mention task context keywords
   if (!TASK_CONTEXT_PATTERN.test(lastAssistantContent)) {
     return `⚠️ IDLE: No task progress mentioned in recent response. Resume: ${running.id}. ${running.title}`;
   }
   return null;
 }
 
-// --- Injection Context Builder ---
+// --- Forced Continuation Context Builder ---
 
-function buildInjectionContext(
+function buildForcedContinuationContext(
   state: WorkflowState,
   incomplete: TaskItem[],
   blocked: TaskItem[],
@@ -369,6 +556,7 @@ function buildInjectionContext(
   const afterNext = incomplete.filter((t) => t !== nextTask).slice(0, 3);
   const completed = state.tasks.filter((t) => t.status === "completed").length;
   const total = state.tasks.length;
+  const stopAllowed = isStopAllowed(state);
 
   const lines: string[] = [
     `🔴 WORKFLOW ACTIVE — ${state.title}`,
@@ -408,10 +596,18 @@ function buildInjectionContext(
     lines.push(idleWarning, "");
   }
 
-  lines.push("Rules:");
-  lines.push("- Complete all tasks before declaring workflow done.");
-  lines.push("- Provide evidence for completed tasks.");
-  lines.push("- If blocked, explain why and what's needed.");
+  // --- Forced continuation directives (MUST, not suggestion) ---
+  lines.push("MANDATORY RULES:");
+  lines.push("- You MUST complete all tasks before declaring this workflow done.");
+  lines.push("- You MUST use tasklist_update to set evidence when completing a task.");
+  lines.push("- You MUST continue with the next pending/running task after completing one.");
+  lines.push("- If blocked, you MUST explain why and what is needed to unblock.");
+
+  if (!stopAllowed) {
+    lines.push("");
+    lines.push("⚠️ STOP GATE: You have incomplete tasks. Do NOT stop or declare completion.");
+    lines.push("To stop early, use one of: /stop, /abort, or /force-finish");
+  }
 
   return lines.join("\n");
 }
@@ -426,28 +622,6 @@ function readConfig(api: Record<string, unknown>): PluginConfig {
     forceContinuation: cfg?.forceContinuation ?? true,
     cancelKeywords: cfg?.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS,
   };
-}
-
-function getTaskFlow(api: Record<string, unknown>, ctx: ToolContext): FlowLike | undefined {
-  try {
-    return (api as any).runtime?.tasks?.flow?.fromToolContext?.(ctx) as FlowLike | undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function findActiveWorkflow(
-  api: Record<string, unknown>,
-  event: PromptBuildEvent,
-): FlowLike | undefined {
-  try {
-    return (
-      ((api as any).runtime?.tasks?.flow?.fromPromptContext?.(event) as FlowLike | undefined) ??
-      ((api as any).runtime?.tasks?.flow?.fromEvent?.(event) as FlowLike | undefined)
-    );
-  } catch {
-    return undefined;
-  }
 }
 
 function readWorkflowState(value: unknown): WorkflowState | undefined {
