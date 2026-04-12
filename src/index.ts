@@ -1,20 +1,19 @@
 /**
- * Structured Workflow Plugin for OpenClaw v0.7.0
+ * Structured Workflow Plugin for OpenClaw v0.8.0
  *
- * TaskFlow前提の behavior layer。進行制御を担う。
- * v0.7.0: 強制継続（命令注入）, 停止許可状態機械, 複雑指示検知ヒューリスティック
+ * TaskFlow前提の task orchestration plugin。
+ *
+ * v0.8.0 変更点:
+ * - 強制継続注入（before_prompt_build）を削除
+ *   理由: 止まった後の次の受信で注入しても遅い。before_prompt_buildは次レスポンス生成前の
+ *   フックであり、すでにユーザーに回答が届いた後では「止まるな」と言っても意味がない。
+ *   真の強制継続には after_response フック（OpenClaw本体未実装）が必要。
+ * - 複雑指示検知による tasklist_create 促進は残す（これは新規ワークフロー作成なので有意味）
  *
  * Runtime契約:
  * - ツールは tool factory context (ctx.sessionKey) があれば登録、なければスキップ
  * - Hook (before_prompt_build) は hookCtx.sessionKey + bindSession で TaskFlow 取得
- * - TaskFlow取得: fromToolContext (tool factory) / bindSession (hooks)
- * - 参考実装: lobster (factory pattern + ctx.sessionKey guard), webhooks (bindSession), inbox-triage
- *
- * Behavior層の責務:
- * - いつ tasklist を作るか（複雑指示検知）
- * - いつ「まだ止まるな」を発火するか（強制継続）
- * - 停止許可条件をどう判定するか（状態機械）
- * - 進行状態の注入（現在タスク・次タスク・完了条件）
+ * - 参考実装: lobster (factory pattern), webhooks (bindSession), inbox-triage
  */
 
 import { Type } from "@sinclair/typebox";
@@ -60,7 +59,6 @@ interface WorkflowState {
 
 interface PluginConfig {
   permissionMode?: PermissionMode;
-  forceContinuation?: boolean;
   cancelKeywords?: string[];
 }
 
@@ -109,7 +107,6 @@ type HookAgentContext = {
 // --- Constants ---
 
 const PLUGIN_ID = "structured-workflow";
-const DEFAULT_CANCEL_KEYWORDS = ["/stop", "やめて", "ストップ", "キャンセル", "cancel", "stop", "/abort", "/force-finish"];
 
 // 複雑指示検知キーワード
 const COMPLEXITY_KEYWORDS = [
@@ -137,7 +134,7 @@ export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Structured Workflow",
   description:
-    "TaskFlow-based task orchestration with forced continuation, stop gate, complexity detection, and phase injection.",
+    "TaskFlow-based task orchestration with complexity detection and task decomposition prompting.",
 
   register(api: any) {
     const logger = api.logger ?? { info: () => {}, warn: () => {}, error: () => {} };
@@ -399,76 +396,47 @@ export default definePluginEntry({
     }), { optional: true });
 
     // --- Hook: before_prompt_build ---
-    // Behavior layer: forced continuation, stop gate, complexity detection, phase injection
+    // Only does complexity detection to prompt tasklist_create.
+    // Forced continuation injection removed: it fires AFTER the agent already responded,
+    // so it can't actually prevent stopping. A real stop gate needs after_response hook
+    // (not yet available in OpenClaw).
     api.on(
       "before_prompt_build",
       async (event: PromptBuildEvent, hookCtx: HookAgentContext) => {
-        const config = readConfig(api);
         const sessionKey = hookCtx?.sessionKey;
         if (!sessionKey) return {};
 
         const incomingText = event.prompt ?? "";
         const messages = event.messages ?? [];
-        const lastUserMsg = [...messages].reverse().find((m: any) => m.role === "user");
-        const lastAssistantMsg = [...messages].reverse().find((m: any) => m.role === "assistant");
-        const fullText = [incomingText, lastUserMsg?.content].filter(Boolean).join("\n");
-
-        // --- Stop gate: cancel keywords allow immediate stop ---
-        if (containsKeyword(fullText, config.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS)) {
-          return {};
-        }
-
-        // --- Stop gate: STOP_REQUEST in prior assistant message ---
-        if (/STOP_REQUEST/.test(lastAssistantMsg?.content ?? "")) return {};
+        const fullText = [incomingText, ...messages.map((m: any) => m.content ?? "").reverse()].filter(Boolean).join("\n");
 
         if (!flowApi) return {};
 
         const boundFlow = flowApi.bindSession({ sessionKey });
         const latest = boundFlow.findLatest();
-        const hasActiveFlow = !!latest;
-        const state = hasActiveFlow ? readWorkflowState((latest as any)?.stateJson) : undefined;
 
-        // --- Complexity detection: suggest tasklist_create for complex instructions ---
-        // Only when no active workflow exists
-        if (!hasActiveFlow && isComplexInstruction(fullText)) {
+        // --- Only inject when no active workflow exists and instruction is complex ---
+        if (!latest && isComplexInstruction(fullText)) {
           const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
           return {
             prependSystemContext: [
-              "🔴 STRUCTURED WORKFLOW — Complex instruction detected.",
+              "🔴 WORKFLOW ACTIVE",
               "",
-              "You MUST use tasklist_create to decompose this task before proceeding.",
+              "Complex instruction detected. You MUST use tasklist_create to decompose this task before proceeding.",
               "Use this task skeleton as a starting point, adjusting to the specific request:",
               skeleton,
               "",
+              "⚠️ IDLE: No task progress mentioned in recent response. Resume the next task.",
+              "",
               "Rules:",
-              "- Use tasklist_create BEFORE starting any work.",
-              "- Set decisionPolicy: 'deliberate' for design/architecture decisions.",
-              "- Provide evidence for every completed task.",
-              "- Do NOT declare the workflow done until all tasks are completed or blocked.",
+              "- You MUST complete all tasks before declaring this workflow done.",
+              "- Provide evidence for completed tasks.",
+              "- If blocked, explain why and what's needed.",
             ].join("\n"),
           };
         }
 
-        // --- If no active workflow and not complex, do nothing ---
-        if (!state) return {};
-
-        const incomplete = state.tasks.filter(
-          (t) => t.status === "pending" || t.status === "running",
-        );
-        const blocked = state.tasks.filter((t) => t.status === "blocked");
-
-        // --- Stop gate: all tasks terminal = stop allowed ---
-        if (incomplete.length === 0 && blocked.length === 0) {
-          // All terminal — no injection needed
-          return {};
-        }
-
-        // --- Forced continuation: incomplete tasks remain ---
-        const idleWarning = detectIdle(incomplete, lastAssistantMsg?.content ?? "");
-
-        return {
-          prependSystemContext: buildForcedContinuationContext(state, incomplete, blocked, idleWarning),
-        };
+        return {};
       },
     );
   },
@@ -487,129 +455,17 @@ function isComplexInstruction(text: string): boolean {
 
   let score = 0;
 
-  // Multi-sentence requests
   const sentences = text.split(/[。.!?！？\n]/).filter((s) => s.trim().length > 5);
   if (sentences.length >= 3) score += 2;
 
-  // Keyword matching
   const keywordHits = COMPLEXITY_KEYWORDS.filter((kw) => text.toLowerCase().includes(kw.toLowerCase()));
   score += Math.min(keywordHits.length, 3);
 
-  // Multi-step indicators
   if (/してから|した後に|終わったら|終わらせて|then|after|before|まで/i.test(text)) score += 2;
   if (/全て|すべて|全部|all|every|entire/i.test(text)) score += 1;
-
-  // Task-like structure
   if (/番目|第[0-9]|ステップ|step|phase|段階/i.test(text)) score += 2;
 
   return score >= 3;
-}
-
-// --- Stop Gate State Machine ---
-
-/**
- * Stop allowed conditions:
- * 1. All tasks completed/skipped (no incomplete, no blocked)
- * 2. Cancel keyword detected (handled before this function)
- * 3. All tasks either completed/skipped OR blocked with explicit handoff
- *
- * Stop DENIED when:
- * - Any task is pending or running
- * - Unless blocked + explicit user-facing handoff
- */
-function isStopAllowed(state: WorkflowState): boolean {
-  const incomplete = state.tasks.filter(
-    (t) => t.status === "pending" || t.status === "running",
-  );
-  if (incomplete.length === 0) return true;
-
-  // All remaining are blocked = stop allowed (user handoff)
-  const allBlocked = state.tasks.every(
-    (t) => t.status === "completed" || t.status === "skipped" || t.status === "blocked",
-  );
-  return allBlocked;
-}
-
-// --- Idle Detection ---
-
-const TASK_CONTEXT_PATTERN = /\b(task|current|next|evidence|complete|blocked)\b/i;
-
-function detectIdle(incomplete: TaskItem[], lastAssistantContent: string): string | null {
-  const running = incomplete.find((t) => t.status === "running");
-  if (!running) return null;
-
-  if (!TASK_CONTEXT_PATTERN.test(lastAssistantContent)) {
-    return `⚠️ IDLE: No task progress mentioned in recent response. Resume: ${running.id}. ${running.title}`;
-  }
-  return null;
-}
-
-// --- Forced Continuation Context Builder ---
-
-function buildForcedContinuationContext(
-  state: WorkflowState,
-  incomplete: TaskItem[],
-  blocked: TaskItem[],
-  idleWarning: string | null,
-): string {
-  const nextTask = incomplete.find((t) => t.status === "running") ?? incomplete[0];
-  const afterNext = incomplete.filter((t) => t !== nextTask).slice(0, 3);
-  const completed = state.tasks.filter((t) => t.status === "completed").length;
-  const total = state.tasks.length;
-  const stopAllowed = isStopAllowed(state);
-
-  const lines: string[] = [
-    `🔴 WORKFLOW ACTIVE — ${state.title}`,
-    `Progress: ${completed}/${total} complete | ${incomplete.length} remaining`,
-    "",
-  ];
-
-  if (nextTask) {
-    lines.push(`▸ Current: ${nextTask.id}. ${nextTask.title} (${nextTask.status})`);
-    if (nextTask.description) lines.push(`  ${nextTask.description}`);
-    if (nextTask.references?.length) {
-      for (const ref of nextTask.references) {
-        const note = ref.note ? ` — ${ref.note.slice(0, 120)}` : "";
-        lines.push(`  📎 ${ref.type}: ${ref.value}${note}`);
-      }
-    }
-    lines.push("");
-  }
-
-  if (afterNext.length > 0) {
-    lines.push("Remaining:");
-    for (const t of afterNext) {
-      lines.push(`  ${STATUS_ICONS[t.status]} ${t.id}. ${t.title}`);
-    }
-    lines.push("");
-  }
-
-  if (blocked.length > 0) {
-    lines.push("🚫 Blocked:");
-    for (const b of blocked) {
-      lines.push(`  - ${b.id}. ${b.title}${b.blockedReason ? `: ${b.blockedReason}` : ""}`);
-    }
-    lines.push("");
-  }
-
-  if (idleWarning) {
-    lines.push(idleWarning, "");
-  }
-
-  // --- Forced continuation directives (MUST, not suggestion) ---
-  lines.push("MANDATORY RULES:");
-  lines.push("- You MUST complete all tasks before declaring this workflow done.");
-  lines.push("- You MUST use tasklist_update to set evidence when completing a task.");
-  lines.push("- You MUST continue with the next pending/running task after completing one.");
-  lines.push("- If blocked, you MUST explain why and what is needed to unblock.");
-
-  if (!stopAllowed) {
-    lines.push("");
-    lines.push("⚠️ STOP GATE: You have incomplete tasks. Do NOT stop or declare completion.");
-    lines.push("To stop early, use one of: /stop, /abort, or /force-finish");
-  }
-
-  return lines.join("\n");
 }
 
 // --- Utilities ---
@@ -619,8 +475,7 @@ function readConfig(api: Record<string, unknown>): PluginConfig {
     typeof api.getConfig === "function" ? (api.getConfig() as PluginConfig | undefined) : undefined;
   return {
     permissionMode: cfg?.permissionMode ?? "bypass",
-    forceContinuation: cfg?.forceContinuation ?? true,
-    cancelKeywords: cfg?.cancelKeywords ?? DEFAULT_CANCEL_KEYWORDS,
+    cancelKeywords: cfg?.cancelKeywords ?? [],
   };
 }
 
@@ -693,11 +548,6 @@ function formatTaskList(state: WorkflowState, flowId?: string, revision?: number
   }
 
   return lines.join("\n");
-}
-
-function containsKeyword(text: string, keywords: string[]): boolean {
-  const normalized = text.toLowerCase();
-  return keywords.some((k) => normalized.includes(k.toLowerCase()));
 }
 
 function toolError(message: string) {
