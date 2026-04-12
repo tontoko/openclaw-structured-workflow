@@ -1,102 +1,161 @@
-# Design: Structured Workflow Plugin
+# Design: Structured Workflow Plugin v0.4.0
 
-## Architecture
+## Responsibility
 
-```
-┌─────────────────────────────────────────────┐
-│              OpenClaw Gateway                │
-├─────────────────────────────────────────────┤
-│  Plugin: structured-workflow                │
-│  ├─ Tools (4)                               │
-│  │  ├─ tasklist_create                      │
-│  │  ├─ tasklist_update                      │
-│  │  ├─ tasklist_status                      │
-│  │  └─ tasklist_permission                  │
-│  └─ Hook (1)                                │
-│     └─ before_prompt_build (forced continu.)│
-├─────────────────────────────────────────────┤
-│  Storage Layer                              │
-│  ├─ TaskFlow Runtime (preferred)            │
-│  │  └─ api.runtime.tasks.flow               │
-│  └─ Standalone Fallback (in-memory Map)     │
-│     └─ standaloneStore (max 50 entries)     │
-└─────────────────────────────────────────────┘
-```
+TaskFlow 前提の薄い behavior layer。
 
-## Dual Storage Mode
+### やる
+- tasklist tools (create/update/status/permission)
+- phase 注入 (plan→exec→verify→fix)
+- current/next/completion condition 注入
+- evidence 要求
+- idle 検知 (停滞検出 + hook 発火まで)
+- reference 統合 (宣言正規化 + path/url + short note 整形)
 
-### TaskFlow Mode (preferred)
-- Used when `api.runtime.tasks.flow.fromToolContext(ctx)` succeeds
-- Durable state, revision tracking, session binding
-- Requires `ctx.sessionKey` (available in main/agent sessions)
+### やらない
+- standalone fallback / 独自 state store
+- 独自永続化
+- audit log
+- IntentGate / safety policy
+- 承認・権限ポリシー本体
+- 他 agent orchestration 本体
 
-### Standalone Mode (fallback)
-- Activated when TaskFlow throws (missing `sessionKey`)
-- In-memory `Map<string, { state, revision }>`
-- GC: prunes to 50 entries on new workflow creation
-- Survives for gateway process lifetime only
-- `tasklist_permission` stores mode in `standalonePermissionMode`
-
-## Tool Flow
+## 3-Layer Separation
 
 ```
-tasklist_create:
-  1. Try getTaskFlow(api, ctx) → catch → undefined
-  2. If TaskFlow: createManaged() → flowId + revision
-  3. If standalone: increment counter → store in Map
-  4. Return formatted task list
-
-tasklist_update:
-  1. Try getTaskFlow → TaskFlow state
-  2. If no TaskFlow: find latest from standaloneStore
-  3. Apply status change, optional fields
-  4. Write back to respective store
-  5. If running + sessionKey + TaskFlow: runTask()
-
-tasklist_status:
-  1. Try TaskFlow first, then standalone
-  2. Return formatted progress
-
-tasklist_permission:
-  1. Try api.updateConfig() (plugin config persistence)
-  2. If unavailable: store in standalonePermissionMode + update all workflows
+┌─────────────────────────────────────┐
+│  OpenClaw                           │
+│  実行基盤: session/tool/runtime/権限  │
+│  /安全/配信/監査                     │
+├─────────────────────────────────────┤
+│  TaskFlow                           │
+│  durable state machine: flow ID,    │
+│  revision, wait/resume, child-link, │
+│  state 永続                         │
+├─────────────────────────────────────┤
+│  structured-workflow plugin         │
+│  薄い behavior layer: phase 注入,   │
+│  current/next/completion, evidence, │
+│  idle hook, reference 統合           │
+└─────────────────────────────────────┘
 ```
+
+### 境界破壊の例 (やってはいけないこと)
+- OpenClaw が phase 分岐を持つ
+- TaskFlow が承認判定ポリシーを持つ
+- plugin が DB 永続化や独自 state store を持つ
+
+## Tools
+
+4 tools (変更なし):
+- `tasklist_create`: task list 作成
+- `tasklist_update`: status 更新
+- `tasklist_status`: 現在状態表示
+- `tasklist_permission`: permission mode 切替
 
 ## Hook: before_prompt_build
 
+### 注入テンプレ構造
+
 ```
-On every prompt build:
-  1. Check forceContinuation config (default: true)
-  2. Check cancel keywords in incoming message → skip if found
-  3. Check STOP_REQUEST in previous response → skip if found
-  4. Try findActiveWorkflow(api, event) → TaskFlow
-  5. If no TaskFlow: check standaloneStore for latest workflow
-  6. Find incomplete tasks (pending/running)
-  7. If found: inject prependSystemContext with continuation reminder
+🔴 WORKFLOW ACTIVE — [title]
+Phase: [current_phase]
+
+▸ Current: [id]. [title] ([status])
+  [description (1-2行)]
+▸ Next: [id]. [title] ([status])
+
+Completion:
+  - [condition_1]
+  - [condition_2]
+
+Evidence required:
+  - [evidence_description]
+
+[IF blocked tasks exist]
+🚫 Blocked:
+  - [id]. [title]: [blockedReason]
+[END]
+
+[IF idle detected]
+⚠️ IDLE: No progress on task/evidence in 3 turns / 15 min.
+  → Resume current task or resolve blockers.
+[END]
+
+[IF references exist]
+📎 References:
+  - [path|url] [value] — [note (≤120 chars)]
+[END]
+
+Rules:
+- Complete all tasks before declaring workflow done.
+- Provide evidence for completed tasks.
+- If blocked, explain why and what's needed.
 ```
 
-## Configuration Requirements
+### Idle Detection
 
-### tools.alsoAllow
-Plugin tools are NOT included in `tools.profile: "coding"`. Must add:
-```json
-"alsoAllow": ["tasklist_create", "tasklist_update", "tasklist_status", "tasklist_permission"]
+複合条件 (全て満たしたら発火):
+1. running task が存在
+2. 直近 3 ターンの assistant 応答に `task/current/next/evidence` のいずれも未言及
+3. 15 分以上経過
+
+発火時の挙動:
+- warning 注入
+- current task 再提示
+- blocked 候補提示
+- verify 送りはしない
+
+### References
+
+task ごとに optional:
+```ts
+references?: Array<{
+  type: "path" | "url";
+  value: string;
+  note?: string; // max 120 chars
+}>
 ```
 
-### Plugin config
+- plugin は宣言の正規化 + `path/url — short note` 整形まで
+- 実際の read/fetch/要約は skill/agent 側の責務
+
+## Storage
+
+TaskFlow runtime のみ使用。standalone fallback は v0.4.0 で削除。
+
+## Configuration
+
 ```json
 {
   "permissionMode": "bypass" | "allow-after-first" | "confirm-each",
   "forceContinuation": true,
-  "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"],
-  "flowDetectionMode": "auto" | "keyword-only",
-  "activationKeywords": ["ultrawork", "ulw", "task-driven"]
+  "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"]
 }
 ```
 
-## Key Learnings
+## 他プラグインからの採用
 
-1. **TaskFlow fromToolContext throws**: `ctx.sessionKey` is validated inside OpenClaw's runtime before returning. Must use try-catch.
-2. **Plugin tools need alsoAllow**: `tools.profile: "coding"` is a whitelist that excludes plugin tools.
-3. **@sinclair/typebox**: Must be in plugin's `dependencies` even though OpenClaw provides it at runtime (path resolution issue).
-4. **SeaORM Proxy API**: `ProxyRow`/`ProxyExecResult` are not re-exported at crate root. Use simpler Extension-based approaches instead.
+### 採用
+- ClaudeCode 系の phase 構造 (plan→exec→verify→fix)
+- Claude Code 公式の hook/event 駆動
+- AWS Amplify 系の reference 統合
+- Todo Enforcer 系の idle 検知
+
+### 条件付き採用
+- deep-interview→plan: 常時ではなく曖昧/高リスク時のみ
+
+### 不採用
+- ULW 200+行の巨大注入
+- Ralph Loop
+- IntentGate
+- audit log
+- 独自 persistent memory / 自律改善
+
+## Key Learnings (v0.1.0〜v0.3.0)
+
+1. **TaskFlow fromToolContext throws**: `ctx.sessionKey` が必要。try-catch 必須。
+2. **Plugin tools need alsoAllow**: `tools.profile: "coding"` は plugin tools を含まない。
+3. **@sinclair/typebox**: dependencies に必須 (runtime path resolution の問題)。
+4. **責務が広がりやすい**: plugin に state store / audit / safety を混ぜると境界破壊。
+5. **standalone fallback は負債**: TaskFlow 前提に割り切る方が健全。

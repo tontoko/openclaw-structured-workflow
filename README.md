@@ -1,15 +1,25 @@
 # Structured Workflow Plugin for OpenClaw
 
-Task-list driven workflow with structured decomposition, decision policies, permission modes, and forced continuation.
+TaskFlow 前提の薄い behavior layer。task 状態に応じて、phase と completion guidance を動的注入します。
 
-## Features
+## Responsibility
 
-- **Structured Task Lists**: Create decomposed task lists with IDs, titles, descriptions, and decision policies
-- **Decision Policies**: `auto`, `deliberate`, `confirm`, `notify` — control how each task is executed
-- **Permission Modes**: `bypass`, `allow-after-first`, `confirm-each` — scope agent autonomy
-- **Forced Continuation**: `before_prompt_build` hook injects context to keep agents on-task
-- **TaskFlow Compatible**: Uses OpenClaw's TaskFlow runtime when available; falls back to standalone in-memory mode
-- **Cancel Keywords**: Users can cancel with `/stop`, `キャンセル`, etc.
+この plugin の責務は次だけです。
+
+- **Structured Task Lists**: tasklist tools で task 状態を扱う
+- **Phase Injection**: `plan -> exec -> verify -> fix` を注入する
+- **Completion Guidance**: current / next / completion condition / evidence を注入する
+- **Idle Detection**: 停滞を検出し、current task へ戻す warning を出す
+- **Reference Integration**: task に紐づく reference を軽量整形して注入する
+
+この plugin が**持たない**責務:
+
+- standalone fallback / 独自 state store
+- 独自永続化
+- audit log
+- IntentGate / safety policy
+- 承認・権限ポリシー本体
+- 他 agent orchestration 本体
 
 ## Installation
 
@@ -53,9 +63,7 @@ Add plugin tools to `tools.alsoAllow` in your OpenClaw config (`~/.openclaw/open
         "config": {
           "permissionMode": "bypass",
           "forceContinuation": true,
-          "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"],
-          "flowDetectionMode": "auto",
-          "activationKeywords": ["ultrawork", "ulw", "task-driven"]
+          "cancelKeywords": ["/stop", "キャンセル", "cancel", "stop"]
         }
       }
     }
@@ -123,27 +131,59 @@ Valid modes: `bypass`, `allow-after-first`, `confirm-each`
 | `confirm` | Agent waits for explicit user approval |
 | `notify` | Agent informs user after completion |
 
-## Standalone Mode
-
-When OpenClaw's TaskFlow runtime is not available (e.g., sub-agent sessions without `sessionKey`), the plugin automatically falls back to an in-memory store. All tools work in standalone mode:
-
-- Workflows are stored in memory for the gateway process lifetime
-- Revision tracking still works
-- `tasklist_permission` requires `api.updateConfig` (not available in standalone)
-
 ## Hook: `before_prompt_build`
 
-When a workflow has incomplete tasks, the plugin injects a system context reminder:
+この plugin の中核です。workflow が active なとき、動的に次を注入します。
 
-```
-Continue the active structured workflow.
-Workflow: Implement Feature X
-Remaining tasks: 2
-Focus on the next pending or running task before answering anything else.
-If the user explicitly requested cancellation, honor it instead.
+### Core sections (毎回)
+- workflow title
+- current phase
+- current task (+ status)
+- next task (+ status)
+- completion condition
+- required evidence
+
+### Conditional sections (必要時のみ)
+- blocked summary
+- idle warning
+- references
+- short rules
+
+テンプレ方針:
+- 通常 40-70 行
+- 最大でも 100 行未満
+- 2k tokens 未満
+- 長文禁止、要約優先
+
+### Idle detection
+
+次の複合条件で停滞を検出します。
+- running task が継続中
+- 直近 3 ターンで `task/current/next/evidence` に未言及
+- 15 分以上経過
+
+発火時は:
+- warning を注入
+- current task を再提示
+- blocked 候補を提示
+
+### References
+
+task ごとに次の形式を持てます。
+
+```json
+{
+  "references": [
+    { "type": "path", "value": "docs/design.md", "note": "設計正本" },
+    { "type": "url", "value": "https://docs.example.com", "note": "外部仕様" }
+  ]
+}
 ```
 
-This keeps the agent focused on completing the task list.
+- `type`: `path | url`
+- `note`: 任意、120 文字以内
+- plugin は宣言の正規化と `path/url + short note` 整形まで担当
+- 実際の read/fetch/要約は skill / agent 側の責務
 
 ## Development
 
