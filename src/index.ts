@@ -147,6 +147,7 @@ const VOLATILE_PROMPT_MARKERS = [
 const DEFAULT_ACTIVATION_KEYWORDS = ["ultrawork", "ulw"];
 const MAX_REFERENCE_COUNT = 3;
 const MAX_REFERENCE_NOTE_CHARS = 96;
+const DEFAULT_VISIBLE_ACK = "ULW enabled.";
 
 // 複雑指示検知キーワード
 const COMPLEXITY_KEYWORDS = [
@@ -509,19 +510,10 @@ export default definePluginEntry({
       if (shouldSuggestWorkflow(promptSnapshot.latestText, cfg)) {
         const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
         return {
-          prependSystemContext: [
-            "🔴 WORKFLOW BOOTSTRAP",
-            "",
-            "Complex instruction detected. You MUST use tasklist_create to decompose this task before proceeding.",
-            "Use this task skeleton as a starting point, adjusting to the specific request:",
+          prependSystemContext: buildWorkflowBootstrapPrompt(
             skeleton,
-            "",
-            "Rules:",
-            "- Keep task ids stable once created.",
-            "- Track current and next work explicitly.",
-            "- Provide evidence for completed tasks.",
-            "- If blocked, explain why and what's needed.",
-          ].join("\n"),
+            matchActivationKeyword(promptSnapshot.latestText, cfg),
+          ),
         };
       }
 
@@ -571,6 +563,15 @@ function shouldSuggestWorkflow(text: string, config: PluginConfig): boolean {
   }
 
   return matchedActivationKeyword || isComplexInstruction(normalized);
+}
+
+function matchActivationKeyword(text: string, config: PluginConfig): string | undefined {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return undefined;
+
+  return (config.activationKeywords ?? DEFAULT_ACTIVATION_KEYWORDS).find((keyword) =>
+    normalized.includes(keyword.toLowerCase()),
+  );
 }
 
 function isVolatilePrompt(text: string): boolean {
@@ -731,6 +732,28 @@ function buildActiveWorkflowBanner(state: WorkflowState): string {
   ];
 
   return lines.join("\n");
+}
+
+function buildWorkflowBootstrapPrompt(skeleton: string, activationKeyword?: string): string {
+  return [
+    "🔴 WORKFLOW BOOTSTRAP",
+    activationKeyword ? `Trigger: explicit keyword \`${activationKeyword}\`` : null,
+    "",
+    `On your next visible reply, start with exactly "${DEFAULT_VISIBLE_ACK}" on its own line.`,
+    "Keep the acknowledgement short and emit it once for this bootstrap only.",
+    "",
+    "Complex instruction detected. You MUST use tasklist_create to decompose this task before proceeding.",
+    "Use this task skeleton as a starting point, adjusting to the specific request:",
+    skeleton,
+    "",
+    "Rules:",
+    "- Keep task ids stable once created.",
+    "- Track current and next work explicitly.",
+    "- Provide evidence for completed tasks.",
+    "- If blocked, explain why and what's needed.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function determinePhase(tasks: TaskItem[]): "plan" | "execute" | "verify" | "fix" {

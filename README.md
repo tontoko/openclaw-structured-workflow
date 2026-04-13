@@ -19,6 +19,8 @@ blocks.
 - Skips injection on volatile turns such as reminders, internal runtime context,
   queued-message wrappers, and async command notices
 - Offers workflow bootstrap guidance only for explicit ultrawork triggers
+- Requests a one-time visible acknowledgement (`ULW enabled.`) when explicit
+  ultrawork bootstrap is triggered
 
 ## What It Does Not Do
 
@@ -39,6 +41,16 @@ incoming prompt explicitly includes one of these activation keywords:
 
 Complex-looking requests without those keywords do **not** trigger workflow
 bootstrap by default.
+
+When bootstrap is triggered by `ulw` or `ultrawork`, the plugin asks the agent
+to begin its first visible reply with:
+
+```text
+ULW enabled.
+```
+
+This keeps the opt-in state visible without adding a noisy banner on every
+subsequent turn.
 
 ## Installation
 
