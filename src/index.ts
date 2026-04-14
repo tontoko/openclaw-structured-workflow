@@ -469,7 +469,7 @@ export default definePluginEntry({
 
       if (shouldSuggestWorkflow(promptSnapshot.latestText, cfg)) {
         const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
-        pendingVisibleAckSessions.add(sessionKey);
+        for (const ackKey of collectAckKeys(hookCtx)) pendingVisibleAckSessions.add(ackKey);
         return {
           prependSystemContext: buildWorkflowBootstrapPrompt(
             skeleton,
@@ -482,8 +482,13 @@ export default definePluginEntry({
     });
 
     api.on("before_message_write", (event: { message?: unknown }, hookCtx: HookAgentContext) => {
-      const sessionKey = hookCtx?.sessionKey;
-      if (!sessionKey || !pendingVisibleAckSessions.has(sessionKey)) return undefined;
+      const ackKeys = collectAckKeys(hookCtx);
+      if (
+        ackKeys.length === 0 ||
+        !ackKeys.some((ackKey) => pendingVisibleAckSessions.has(ackKey))
+      ) {
+        return undefined;
+      }
 
       const message = event?.message;
       if (!message || typeof message !== "object") return undefined;
@@ -493,7 +498,7 @@ export default definePluginEntry({
       const nextContent = prependVisibleAckToContent(candidate.content, DEFAULT_VISIBLE_ACK);
       if (nextContent === candidate.content) return undefined;
 
-      pendingVisibleAckSessions.delete(sessionKey);
+      for (const ackKey of ackKeys) pendingVisibleAckSessions.delete(ackKey);
       return {
         message: {
           ...candidate,
@@ -503,7 +508,7 @@ export default definePluginEntry({
     });
 
     api.on("session_end", async (_event: unknown, hookCtx: HookAgentContext) => {
-      if (hookCtx?.sessionKey) pendingVisibleAckSessions.delete(hookCtx.sessionKey);
+      for (const ackKey of collectAckKeys(hookCtx)) pendingVisibleAckSessions.delete(ackKey);
     });
   },
 });
@@ -512,6 +517,12 @@ export default definePluginEntry({
 
 function resolveFlowApi(api: any): TaskFlowApi | undefined {
   return api?.runtime?.taskFlow ?? api?.runtime?.tasks?.flow;
+}
+
+function collectAckKeys(ctx: HookAgentContext | undefined): string[] {
+  return [ctx?.sessionKey, ctx?.sessionId, ctx?.agentId].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
 }
 
 function readPromptSnapshot(event: PromptBuildEvent): { latestText: string } {
