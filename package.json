@@ -29,7 +29,14 @@
     "@sinclair/typebox": "0.34.49"
   },
   "devDependencies": {
+    "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "ultracite": "^7.4.4"
+  },
+  "scripts": {
+    "check": "npm run lint && npm run typecheck && npm test",
+    "lint": "ultracite check .",
+    "test": "tsx --test tests/**/*.test.ts",
+    "typecheck": "tsc --noEmit"
   }
 }

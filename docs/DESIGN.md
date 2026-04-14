@@ -98,16 +98,19 @@ The banner phase is derived from task state:
 
 If no active workflow exists, the plugin can inject a bootstrap prompt that requires `tasklist_create`.
 
-Modes:
+Supported modes:
 
-- `auto`: complex-instruction heuristic OR activation keyword
 - `keyword-only`: activation keyword only
+- `auto`: complex-instruction heuristic OR activation keyword, for experiments only
+
+Default mode:
+
+- `keyword-only`
 
 Default activation keywords:
 
 - `ultrawork`
 - `ulw`
-- `task-driven`
 
 ## Deprecated Config
 
