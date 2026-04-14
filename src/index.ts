@@ -17,8 +17,10 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
   buildWorkflowBootstrapPrompt,
   DEFAULT_ACTIVATION_KEYWORDS,
+  DEFAULT_VISIBLE_ACK,
   isVolatilePrompt,
   matchActivationKeyword,
+  prependVisibleAckToContent,
   shouldSuggestWorkflow,
 } from "./workflow-helpers.js";
 
@@ -164,6 +166,7 @@ export default definePluginEntry({
     const logger = api.logger ?? { info: () => {}, warn: () => {}, error: () => {} };
 
     const flowApi = resolveFlowApi(api);
+    const pendingVisibleAckSessions = new Set<string>();
 
     // --- Tool factory pattern (lobster-style) ---
     api.registerTool(
@@ -466,6 +469,7 @@ export default definePluginEntry({
 
       if (shouldSuggestWorkflow(promptSnapshot.latestText, cfg)) {
         const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
+        pendingVisibleAckSessions.add(sessionKey);
         return {
           prependSystemContext: buildWorkflowBootstrapPrompt(
             skeleton,
@@ -475,6 +479,31 @@ export default definePluginEntry({
       }
 
       return {};
+    });
+
+    api.on("before_message_write", (event: { message?: unknown }, hookCtx: HookAgentContext) => {
+      const sessionKey = hookCtx?.sessionKey;
+      if (!sessionKey || !pendingVisibleAckSessions.has(sessionKey)) return undefined;
+
+      const message = event?.message;
+      if (!message || typeof message !== "object") return undefined;
+      const candidate = message as { role?: string; content?: unknown };
+      if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return undefined;
+
+      const nextContent = prependVisibleAckToContent(candidate.content, DEFAULT_VISIBLE_ACK);
+      if (nextContent === candidate.content) return undefined;
+
+      pendingVisibleAckSessions.delete(sessionKey);
+      return {
+        message: {
+          ...candidate,
+          content: nextContent,
+        },
+      };
+    });
+
+    api.on("session_end", async (_event: unknown, hookCtx: HookAgentContext) => {
+      if (hookCtx?.sessionKey) pendingVisibleAckSessions.delete(hookCtx.sessionKey);
     });
   },
 });

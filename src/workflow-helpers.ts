@@ -54,6 +54,11 @@ const VOLATILE_PROMPT_MARKERS = [
 export const DEFAULT_ACTIVATION_KEYWORDS = ["ultrawork", "ulw"];
 export const DEFAULT_VISIBLE_ACK = "ULW enabled.";
 
+type TextLikeContent = {
+  type: string;
+  text?: string;
+};
+
 function isComplexInstruction(text: string): boolean {
   if (!text || text.length < 30) return false;
 
@@ -125,4 +130,29 @@ export function buildWorkflowBootstrapPrompt(skeleton: string, activationKeyword
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+export function prependVisibleAckToContent(
+  content: unknown,
+  ack: string = DEFAULT_VISIBLE_ACK,
+): unknown {
+  if (!Array.isArray(content) || content.length === 0) return content;
+  const firstTextIndex = content.findIndex(
+    (item) => item && typeof item === "object" && (item as TextLikeContent).type === "text",
+  );
+  if (firstTextIndex < 0) {
+    return [{ type: "text", text: ack }, ...content];
+  }
+
+  const cloned = [...content];
+  const firstText = cloned[firstTextIndex] as TextLikeContent;
+  if (typeof firstText.text === "string" && firstText.text.startsWith(`${ack}\n`)) {
+    return content;
+  }
+
+  cloned[firstTextIndex] = {
+    ...firstText,
+    text: typeof firstText.text === "string" ? `${ack}\n${firstText.text}` : ack,
+  };
+  return cloned;
 }

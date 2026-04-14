@@ -6,6 +6,7 @@ import {
   DEFAULT_VISIBLE_ACK,
   isVolatilePrompt,
   matchActivationKeyword,
+  prependVisibleAckToContent,
   shouldSuggestWorkflow,
 } from "../src/workflow-helpers.ts";
 
@@ -41,4 +42,20 @@ test("bootstrap prompt requests one-time visible ULW acknowledgement", () => {
   assert.match(prompt, /Trigger: explicit keyword `ulw`/);
   assert.match(prompt, new RegExp(`start with exactly "${DEFAULT_VISIBLE_ACK}"`));
   assert.match(prompt, /emit it once for this bootstrap only/);
+});
+
+test("visible ULW acknowledgement is prepended to first assistant text content", () => {
+  const original = [
+    { type: "thinking", thinking: "internal" },
+    { type: "text", text: "Tasklist created." },
+  ];
+
+  const updated = prependVisibleAckToContent(original, DEFAULT_VISIBLE_ACK) as Array<{
+    type: string;
+    text?: string;
+  }>;
+
+  assert.equal(updated[0]?.type, "thinking");
+  assert.equal(updated[1]?.type, "text");
+  assert.equal(updated[1]?.text, `${DEFAULT_VISIBLE_ACK}\nTasklist created.`);
 });
