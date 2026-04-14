@@ -469,7 +469,11 @@ export default definePluginEntry({
 
       if (shouldSuggestWorkflow(promptSnapshot.latestText, cfg)) {
         const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
-        for (const ackKey of collectAckKeys(hookCtx)) pendingVisibleAckSessions.add(ackKey);
+        const ackKeys = collectAckKeys(hookCtx);
+        for (const ackKey of ackKeys) pendingVisibleAckSessions.add(ackKey);
+        logger.info?.(
+          `[${PLUGIN_ID}] queued visible ack for keys: ${ackKeys.join(", ") || "(none)"}`,
+        );
         return {
           prependSystemContext: buildWorkflowBootstrapPrompt(
             skeleton,
@@ -499,6 +503,7 @@ export default definePluginEntry({
       if (nextContent === candidate.content) return undefined;
 
       for (const ackKey of ackKeys) pendingVisibleAckSessions.delete(ackKey);
+      logger.info?.(`[${PLUGIN_ID}] applied visible ack for keys: ${ackKeys.join(", ")}`);
       return {
         message: {
           ...candidate,
