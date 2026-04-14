@@ -59,6 +59,22 @@ type TextLikeContent = {
   text?: string;
 };
 
+export type VisibleAckSessionContext = {
+  sessionKey?: string;
+};
+
+export type VisibleAckMessageSendingEvent = {
+  to?: string;
+  content?: unknown;
+  metadata?: Record<string, unknown>;
+};
+
+export type VisibleAckMessageSendingContext = {
+  channelId?: string;
+  accountId?: string;
+  conversationId?: string;
+};
+
 function isComplexInstruction(text: string): boolean {
   if (!text || text.length < 30) return false;
 
@@ -146,13 +162,91 @@ export function prependVisibleAckToContent(
 
   const cloned = [...content];
   const firstText = cloned[firstTextIndex] as TextLikeContent;
-  if (typeof firstText.text === "string" && firstText.text.startsWith(`${ack}\n`)) {
-    return content;
+  if (typeof firstText.text === "string") {
+    const nextText = prependVisibleAckToText(firstText.text, ack);
+    if (nextText === firstText.text) return content;
+    cloned[firstTextIndex] = {
+      ...firstText,
+      text: nextText,
+    };
+    return cloned;
   }
 
   cloned[firstTextIndex] = {
     ...firstText,
-    text: typeof firstText.text === "string" ? `${ack}\n${firstText.text}` : ack,
+    text: ack,
   };
   return cloned;
+}
+
+export function prependVisibleAckToText(text: string, ack: string = DEFAULT_VISIBLE_ACK): string {
+  if (!text.trim()) return ack;
+  if (text.startsWith(ack)) return text;
+  if (normalizeVisibleText(text).startsWith(normalizeVisibleText(ack))) return text;
+  return `${ack}\n${text}`;
+}
+
+export function resolveVisibleAckScopeFromSessionContext(
+  ctx: VisibleAckSessionContext | undefined,
+): string | undefined {
+  const sessionKey = ctx?.sessionKey?.trim();
+  if (!sessionKey) return undefined;
+  return normalizeVisibleAckScope(sessionKey);
+}
+
+export function resolveVisibleAckScopeFromMessageSending(
+  event: VisibleAckMessageSendingEvent | undefined,
+  ctx: VisibleAckMessageSendingContext | undefined,
+): string | undefined {
+  const channelId = ctx?.channelId?.trim().toLowerCase();
+  if (!channelId) return undefined;
+
+  const metadata = event?.metadata && typeof event.metadata === "object" ? event.metadata : {};
+  const targetCandidate =
+    readVisibleAckScopeCandidate(metadata.threadId) ??
+    readVisibleAckScopeCandidate(metadata.threadTs) ??
+    readVisibleAckScopeCandidate(metadata.conversationId) ??
+    readVisibleAckScopeCandidate(metadata.channelId) ??
+    readVisibleAckScopeCandidate(event?.to) ??
+    readVisibleAckScopeCandidate(ctx?.conversationId);
+
+  if (!targetCandidate) return `${channelId}:unknown`;
+  return normalizeVisibleAckScope(`${channelId}:${targetCandidate}`);
+}
+
+function normalizeVisibleAckScope(value: string): string {
+  let normalized = value.trim().toLowerCase();
+  if (!normalized) return "";
+
+  normalized = normalized.replace(/^(agent|session|channel|chat|user):/, "");
+  normalized = normalized.replace(/^(main):/, "");
+
+  const threadIndex = normalized.lastIndexOf(":thread:");
+  if (threadIndex >= 0) {
+    const base = normalized.slice(0, threadIndex);
+    const threadId = normalized.slice(threadIndex + 8).trim();
+    const channel = base.split(":").filter(Boolean)[0] ?? "";
+    if (channel && threadId) return `${channel}:${threadId}`;
+    if (threadId) return threadId;
+  }
+
+  const parts = normalized.split(":").filter(Boolean);
+  if (parts.length >= 3) return `${parts[0]}:${parts.slice(2).join(":")}`;
+  if (parts.length === 2) return `${parts[0]}:${parts[1]}`;
+  return normalized;
+}
+
+function readVisibleAckScopeCandidate(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  return normalized.replace(/^(channel|chat|user):/i, "");
+}
+
+export function normalizeVisibleText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }

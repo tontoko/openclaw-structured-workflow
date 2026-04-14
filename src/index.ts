@@ -20,7 +20,8 @@ import {
   DEFAULT_VISIBLE_ACK,
   isVolatilePrompt,
   matchActivationKeyword,
-  prependVisibleAckToContent,
+  normalizeVisibleText,
+  prependVisibleAckToText,
   shouldSuggestWorkflow,
 } from "./workflow-helpers.js";
 
@@ -120,6 +121,14 @@ type HookAgentContext = {
   [key: string]: unknown;
 };
 
+type MessageSendingEvent = {
+  content?: string;
+};
+
+type LlmOutputEvent = {
+  assistantTexts?: string[];
+};
+
 // --- Constants ---
 
 const PLUGIN_ID = "structured-workflow";
@@ -167,6 +176,7 @@ export default definePluginEntry({
 
     const flowApi = resolveFlowApi(api);
     const pendingVisibleAckSessions = new Set<string>();
+    const pendingVisibleAckTextByKey = new Map<string, string>();
 
     // --- Tool factory pattern (lobster-style) ---
     api.registerTool(
@@ -469,11 +479,9 @@ export default definePluginEntry({
 
       if (shouldSuggestWorkflow(promptSnapshot.latestText, cfg)) {
         const skeleton = DEFAULT_TASK_SKELETON.map((t) => `- ${t.id}: ${t.title}`).join("\n");
-        const ackKeys = collectAckKeys(hookCtx);
-        for (const ackKey of ackKeys) pendingVisibleAckSessions.add(ackKey);
-        logger.info?.(
-          `[${PLUGIN_ID}] queued visible ack for keys: ${ackKeys.join(", ") || "(none)"}`,
-        );
+        const ackKey = collectAckKey(hookCtx);
+        if (ackKey) pendingVisibleAckSessions.add(ackKey);
+        logger.info?.(`[${PLUGIN_ID}] queued visible ack for key: ${ackKey ?? "(none)"}`);
         return {
           prependSystemContext: buildWorkflowBootstrapPrompt(
             skeleton,
@@ -485,35 +493,46 @@ export default definePluginEntry({
       return {};
     });
 
-    api.on("before_message_write", (event: { message?: unknown }, hookCtx: HookAgentContext) => {
-      const ackKeys = collectAckKeys(hookCtx);
-      if (
-        ackKeys.length === 0 ||
-        !ackKeys.some((ackKey) => pendingVisibleAckSessions.has(ackKey))
-      ) {
-        return undefined;
+    api.on("llm_output", (event: LlmOutputEvent, hookCtx: HookAgentContext) => {
+      const ackKey = collectAckKey(hookCtx);
+      if (!ackKey || !pendingVisibleAckSessions.has(ackKey)) {
+        return;
       }
+      if (pendingVisibleAckTextByKey.has(ackKey)) return;
 
-      const message = event?.message;
-      if (!message || typeof message !== "object") return undefined;
-      const candidate = message as { role?: string; content?: unknown };
-      if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return undefined;
+      const firstVisibleText = (event.assistantTexts ?? []).find((text) => text.trim().length > 0);
+      if (!firstVisibleText) return;
 
-      const nextContent = prependVisibleAckToContent(candidate.content, DEFAULT_VISIBLE_ACK);
-      if (nextContent === candidate.content) return undefined;
+      const normalized = normalizeVisibleText(firstVisibleText);
+      if (!normalized) return;
 
-      for (const ackKey of ackKeys) pendingVisibleAckSessions.delete(ackKey);
-      logger.info?.(`[${PLUGIN_ID}] applied visible ack for keys: ${ackKeys.join(", ")}`);
+      pendingVisibleAckTextByKey.set(ackKey, normalized);
+    });
+
+    api.on("message_sending", (event: MessageSendingEvent) => {
+      const content = typeof event?.content === "string" ? event.content : "";
+      const normalizedContent = normalizeVisibleText(content);
+      if (!normalizedContent) return undefined;
+
+      const matchedEntry = Array.from(pendingVisibleAckTextByKey.entries()).find(
+        ([, expectedText]) => expectedText === normalizedContent,
+      );
+      if (!matchedEntry) return undefined;
+
+      const [matchedKey] = matchedEntry;
+      pendingVisibleAckTextByKey.delete(matchedKey);
+      pendingVisibleAckSessions.delete(matchedKey);
+
       return {
-        message: {
-          ...candidate,
-          content: nextContent,
-        },
+        content: prependVisibleAckToText(content, DEFAULT_VISIBLE_ACK),
       };
     });
 
     api.on("session_end", async (_event: unknown, hookCtx: HookAgentContext) => {
-      for (const ackKey of collectAckKeys(hookCtx)) pendingVisibleAckSessions.delete(ackKey);
+      const ackKey = collectAckKey(hookCtx);
+      if (!ackKey) return;
+      pendingVisibleAckSessions.delete(ackKey);
+      pendingVisibleAckTextByKey.delete(ackKey);
     });
   },
 });
@@ -524,10 +543,9 @@ function resolveFlowApi(api: any): TaskFlowApi | undefined {
   return api?.runtime?.taskFlow ?? api?.runtime?.tasks?.flow;
 }
 
-function collectAckKeys(ctx: HookAgentContext | undefined): string[] {
-  return [ctx?.sessionKey, ctx?.sessionId, ctx?.agentId].filter(
-    (value): value is string => typeof value === "string" && value.length > 0,
-  );
+function collectAckKey(ctx: HookAgentContext | undefined): string | undefined {
+  const key = ctx?.sessionKey ?? ctx?.sessionId ?? ctx?.agentId;
+  return typeof key === "string" && key.length > 0 ? key : undefined;
 }
 
 function readPromptSnapshot(event: PromptBuildEvent): { latestText: string } {

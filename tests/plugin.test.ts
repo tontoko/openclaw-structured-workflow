@@ -6,7 +6,9 @@ import {
   DEFAULT_VISIBLE_ACK,
   isVolatilePrompt,
   matchActivationKeyword,
+  normalizeVisibleText,
   prependVisibleAckToContent,
+  prependVisibleAckToText,
   shouldSuggestWorkflow,
 } from "../src/workflow-helpers.ts";
 
@@ -58,4 +60,22 @@ test("visible ULW acknowledgement is prepended to first assistant text content",
   assert.equal(updated[0]?.type, "thinking");
   assert.equal(updated[1]?.type, "text");
   assert.equal(updated[1]?.text, `${DEFAULT_VISIBLE_ACK}\nTasklist created.`);
+});
+
+test("visible ULW acknowledgement is prepended to outbound text once", () => {
+  assert.equal(
+    prependVisibleAckToText("Tasklist created."),
+    `${DEFAULT_VISIBLE_ACK}\nTasklist created.`,
+  );
+  assert.equal(
+    prependVisibleAckToText(`${DEFAULT_VISIBLE_ACK}\nTasklist created.`),
+    `${DEFAULT_VISIBLE_ACK}\nTasklist created.`,
+  );
+});
+
+test("normalizeVisibleText collapses whitespace for outbound matching", () => {
+  assert.equal(
+    normalizeVisibleText(" Tasklist   created.\n\nNext step "),
+    "Tasklist created. Next step",
+  );
 });
