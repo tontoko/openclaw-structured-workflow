@@ -129,6 +129,10 @@ type LlmOutputEvent = {
   assistantTexts?: string[];
 };
 
+type BeforeAgentReplyEvent = {
+  cleanedBody?: string;
+};
+
 // --- Constants ---
 
 const PLUGIN_ID = "structured-workflow";
@@ -507,6 +511,32 @@ export default definePluginEntry({
       if (!normalized) return;
 
       pendingVisibleAckTextByKey.set(ackKey, normalized);
+    });
+
+    api.on("before_agent_reply", (event: BeforeAgentReplyEvent, hookCtx: HookAgentContext) => {
+      const ackKey = collectAckKey(hookCtx);
+      if (!ackKey || !pendingVisibleAckSessions.has(ackKey)) {
+        return undefined;
+      }
+
+      const cleanedBody = typeof event?.cleanedBody === "string" ? event.cleanedBody : "";
+      const normalizedBody = normalizeVisibleText(cleanedBody);
+      if (!normalizedBody) return undefined;
+
+      const expectedText = pendingVisibleAckTextByKey.get(ackKey);
+      if (expectedText && expectedText !== normalizedBody) {
+        return undefined;
+      }
+
+      pendingVisibleAckTextByKey.delete(ackKey);
+      pendingVisibleAckSessions.delete(ackKey);
+
+      return {
+        handled: true,
+        reply: {
+          text: prependVisibleAckToText(cleanedBody, DEFAULT_VISIBLE_ACK),
+        },
+      };
     });
 
     api.on("message_sending", (event: MessageSendingEvent) => {
