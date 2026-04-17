@@ -206,6 +206,7 @@ For shared external-service ops, use the library entries
 `external-service-ops`, `linear-demand-routing`, `sentry-signal-routing`,
 `openclaw-chatops-routing`, and `github-review-automation` rather than
 repo-local copies.
+Repo-local pointers live in `docs/agents/README.md`.
 
 ```bash
 npm install
