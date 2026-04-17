@@ -201,6 +201,9 @@ avoidable prompt-cache churn.
 
 ## Development
 
+This repo should point at the shared `~/.codex/skills` library used by polku,
+including the shared external-service skills.
+
 ```bash
 npm install
 npx ultracite fix src/index.ts README.md docs/DESIGN.md openclaw.plugin.json package.json
