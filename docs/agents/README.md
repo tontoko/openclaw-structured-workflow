@@ -1,9 +1,11 @@
 # Agent References
 
 This repo uses the shared Codex skill library at `~/.codex/skills` for external-service operations.
+Repo-local IDs and routing facts live in `docs/service-map.md`, and the shared skills are discoverable through `.agent/skills/` symlinks.
 
 ## Pointer map
 
+- `@service-map` → `docs/service-map.md`
 - `@external-service-ops` → shared skill `external-service-ops`
 - `@linear-demand-routing` → shared skill `linear-demand-routing`
 - `@sentry-signal-routing` → shared skill `sentry-signal-routing`

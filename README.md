@@ -202,6 +202,8 @@ avoidable prompt-cache churn.
 ## Development
 
 This repo should point at the shared `~/.codex/skills` library used by polku.
+The repo also exposes those skills through `.agent/skills/` symlinks and keeps
+repo-local IDs in `docs/service-map.md`.
 For shared external-service ops, use the library entries
 `external-service-ops`, `linear-demand-routing`, `sentry-signal-routing`,
 `openclaw-chatops-routing`, and `github-review-automation` rather than
