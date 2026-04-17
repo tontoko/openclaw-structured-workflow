@@ -10,7 +10,7 @@ Repo-local facts for shared external-service skills live here. Shared skills sho
 
 ## GitHub
 
-- Execution repo: `polku-learning/openclaw-structured-workflow`
+- Execution repo: `tontoko/openclaw-structured-workflow`
 - Review automation scope: GitHub PRs and review threads for this repository
 
 ## Linear
