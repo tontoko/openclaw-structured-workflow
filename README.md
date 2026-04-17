@@ -201,8 +201,11 @@ avoidable prompt-cache churn.
 
 ## Development
 
-This repo should point at the shared `~/.codex/skills` library used by polku,
-including the shared external-service skills.
+This repo should point at the shared `~/.codex/skills` library used by polku.
+For shared external-service ops, use the library entries
+`external-service-ops`, `linear-demand-routing`, `sentry-signal-routing`,
+`openclaw-chatops-routing`, and `github-review-automation` rather than
+repo-local copies.
 
 ```bash
 npm install
